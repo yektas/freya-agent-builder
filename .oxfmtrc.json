@@ -1,0 +1,7 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": ["node_modules/**", "experiments/**", "coverage/**", "pnpm-lock.yaml"],
+  "singleQuote": true,
+  "printWidth": 100,
+  "sortPackageJson": false
+}

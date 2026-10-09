@@ -1,0 +1,6 @@
+{
+  "id": "synthetic-no-tools",
+  "description": "Help a user compare two options using only facts they provide. Ask a focused question when a necessary preference is missing. Do not invent external facts or claim to have searched.",
+  "tools": [],
+  "synthetic": true
+}

@@ -1,0 +1,41 @@
+{
+  "id": "synthetic-reschedule",
+  "description": "Help a customer reschedule an appointment. Preserve the original appointment if the change fails. Ask for the appointment ID and desired time only if not supplied. Do not claim success without a successful tool result.",
+  "tools": [
+    {
+      "name": "get_appointment",
+      "description": "Read the current appointment and its version.",
+      "parameters": {
+        "type": "object",
+        "properties": { "id": { "type": "string" } },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "find_slots",
+      "description": "Find available slots for a date. Availability can change before rescheduling.",
+      "parameters": {
+        "type": "object",
+        "properties": { "date": { "type": "string" } },
+        "required": ["date"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "reschedule",
+      "description": "Atomically reschedule to a slot using the current appointment version. A version conflict or unavailable slot leaves the original unchanged. A transport timeout does not establish success or failure; read the appointment before retrying.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "slotId": { "type": "string" },
+          "version": { "type": "integer" }
+        },
+        "required": ["id", "slotId", "version"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "synthetic": true
+}
