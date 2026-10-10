@@ -1,127 +1,245 @@
-# Freya agent builder preparation kit
+# Freya agent builder
 
-A working local foundation for the October 10–11, 2026 Build the Builder hackathon. It generates internal agent specifications, validates them, optionally audits them with OpenAI Decisions, and records experiments. **It is not yet a competition submission.** The event contract, task-tool bindings, and official evaluator remain unverified.
+A direct-generation builder for the Build the Builder hackathon. The Freya path reads original brief files and OpenAPI, generates a workflow blueprint, binds the original tools locally, registers the selected workflow, exports it, and runs the official practice cases.
 
-## Start offline
+## Generate JSON only
 
-Use Node 22.18.0 or newer with native TypeScript support. The tested version is pinned in `.nvmrc`. There are no runtime dependencies; the lockfile pins the TypeScript compiler and Node types used for development checks.
+Set `OPENAI_API_KEY` and `BUILDER_MODEL` in `.env`, then run:
+
+```sh
+pnpm run generate
+```
+
+This generates a phone-agent **workflow JSON** from Brief A, compiles the tool bindings locally, prints the JSON to the terminal, and saves a local diagnostic trace. It makes one billable OpenAI request. It does not contact Freya, require Freya credentials or Python, or run practice tests. It is locally checked, but has not passed Freya's platform validation or evaluation.
+
+To use another brief, pass `--brief-file`. For B, supply both original briefs:
+
+```sh
+pnpm run generate \
+  --brief-file build-the-builder/briefs/brief-a.md \
+  --brief-file build-the-builder/briefs/brief-b.md
+```
+
+To save the printed JSON yourself:
+
+```sh
+pnpm --silent run generate > workflow.json
+```
+
+The script runs `freya --json-only`. This parameter stops after generation and local compilation; omitting it uses the separately configured full Freya flow below.
+
+### See generation progress
+
+`pnpm run generate` now logs each step to stderr: loaded briefs/docs/tools, the configured model and limits, request acceptance, model activity, elapsed time, token usage when returned, local compilation, model-reported uncertainties, and the resulting nodes/tools/routes. While waiting, it reports elapsed time and received draft characters every ten seconds. These are observed execution steps; the builder still uses one model call.
+
+For more detail:
+
+```sh
+pnpm run generate --reasoning-summary --show-draft
+```
+
+`--reasoning-summary` explicitly requests OpenAI's model-provided reasoning summaries (`reasoning.summary: auto`). Availability depends on the configured model/account. These are summaries, not private internal reasoning. If no summary is returned, the log says so; an unsupported request fails without an automatic retry. See the [official OpenAI reasoning documentation](https://developers.openai.com/api/docs/guides/reasoning).
+
+`--show-draft` streams the raw model JSON as it arrives, clearly labeled unvalidated. Only the completed response is accepted and compiled; an interrupted, refused, or failed stream cannot become the final workflow. The stream follows the [official Responses streaming format](https://developers.openai.com/api/docs/guides/streaming-responses).
+
+Final workflow JSON stays on stdout, so redirecting it to a file still leaves progress visible in the terminal. Use `--quiet` to hide progress:
+
+```sh
+pnpm --silent run generate --reasoning-summary > workflow.json
+pnpm --silent run generate --quiet > workflow.json
+```
+
+### Inspect a saved trace
+
+Every generation creates a unique directory under `experiments/generation/` and prints its absolute path to stderr. It contains:
+
+- `generation.log`: readable progress, streamed drafts, available model summaries, and errors.
+- `trace.jsonl`: timestamped events appended as they arrive, including partial output if generation fails or is interrupted.
+- `run.json`: original inputs, configuration, source snapshot, model request/response, timings, token usage when returned, raw candidate, compiled workflow, and failure details.
+
+Drafts are saved even without `--show-draft`; `--quiet` only suppresses terminal progress. To request model summaries and choose a different log root:
+
+```sh
+pnpm run generate --reasoning-summary --out experiments/debug
+```
+
+Credentials, auth headers, encrypted reasoning, and raw private reasoning are excluded. Logs are Git-ignored by default under `experiments/`; keep custom output directories out of Git too. An abruptly terminated run can retain `status: running` in `run.json`; inspect its last events in `trace.jsonl`. These generation records carry no evaluation score.
+
+## Control the builder
+
+Start with **[src/recipe.ts](src/recipe.ts)**. `freyaRecipe` controls the actual event builder:
+
+- `instructions`: what the builder model reads, follows, and produces.
+- `limits`: one model call, 24,000 output tokens (including reasoning), a five-minute generation deadline, and a 30-minute total deadline including practice tests. JSON-only generation defaults to the recipe's generation deadline; `--timeout-ms` can shorten it.
+- `generate`: generate → compile locally. Used by the JSON-only command.
+- `run`: use `generate`, then platform dry run → register → export → practice.
+
+Choose the builder model through `BUILDER_MODEL` or `--model`. The generated phone agent uses the event model from the original `freya.py`; this integration does not change it. Export happens before practice so a failed or timed-out test preserves the selected workflow.
+
+The model produces graph structure, prompts, transitions, optional Python code, and tool **references**. It never generates tool schemas. The compiler translates those references at the verified event boundary using the supplied OpenAPI. Business rules come from the input briefs, not compiler constants. No automatic repair is included yet.
+
+## Run the full Freya flow
+
+Requires Node 22.18.0+, pnpm, and Python 3.10+. The event client and scorer use Python's standard library; no Claude SDK is needed for our builder.
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm run check # formatting, lint, typecheck, and offline tests
-pnpm run lint
-pnpm run format
-pnpm run format:check
-pnpm run doctor
+pnpm run check
+```
+
+Set `OPENAI_API_KEY` and `BUILDER_MODEL` in `.env` using `.env.example`. Set `FREYA_API_KEY` and one stable `FREYA_BANK_TEAM_KEY` of at least 16 characters in `build-the-builder/env.sh` using the kit's `env.example`. Both credential files are Git-ignored. Set `FREYA_WORKSPACE_ID` if the API key sees multiple workspaces; otherwise the one accessible workspace is verified automatically.
+
+Brief A (all ten A practice cases):
+
+```sh
+node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \
+  --brief-file build-the-builder/briefs/brief-a.md \
+  --practice-brief A --slot brief-a
+```
+
+Brief B builds on A, so pass both files (all three B practice cases):
+
+```sh
+node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \
+  --brief-file build-the-builder/briefs/brief-a.md \
+  --brief-file build-the-builder/briefs/brief-b.md \
+  --practice-brief B --slot brief-b
+```
+
+These are live, billable operations. Original brief/tool/platform-documentation inputs are sent to OpenAI. Freya receives the compiled workflow; the official runner creates synthetic bank practice sessions and runs customer/judge simulations on staging. No final competition submission is made.
+
+For a smaller smoke test, add `--only PUB-01` to the A command. For different customer speech, add `--style pieces`, `corrects`, `talkative`, `asks_back`, or `in_words`. `--openapi FILE` selects another original tool API file; `--kit DIRECTORY` selects the event package. `--timeout-ms` can lower the total deadline, but cannot exceed 1,800,000 ms. See `node src/cli.ts --help`.
+
+A stable `--slot` updates and **publishes** the same workflow on subsequent runs. Slot IDs and the persona cache live under `experiments/freya-state/<workspace>/`. Keep that state and use the same `--out` directory to reuse workflows. One workspace lock prevents concurrent builder runs from racing registration or practice. If a process crashes, inspect the lock's PID/run record before removing a stale lock. An uncertain workflow creation leaves a pending marker: reconcile the remote workflow and local slot before retrying, rather than creating another remote agent.
+
+## Inspect runs in a browser
+
+```sh
+pnpm run ui
+```
+
+Builds the inspector and opens http://127.0.0.1:4317. `--out DIRECTORY` selects a different record root, `--port` changes the port, and `--kit DIRECTORY` selects the event package used by the upload action. The script loads `.env` and `build-the-builder/env.sh` when they exist, so the upload action finds `FREYA_API_KEY`. Use `pnpm run ui:dev` for Vite hot reload while working on the UI.
+
+The inspector is **read-only, with one explicitly authorized exception**. It serves a built static bundle plus a small JSON API over recorded files, binds to loopback, rejects every non-GET request, and serves only artifact names found by its own directory scan, so a requested name never reaches the filesystem unchecked. It never starts a run or a generation. The exception is the upload action below, which registers an already compiled workflow on Freya; nothing else writes.
+
+It discovers all three record shapes together and labels each one:
+
+| Record                                 | Command    | Tabs                                                    |
+| -------------------------------------- | ---------- | ------------------------------------------------------- |
+| `experiments/<uuid>/run.json`          | `freya`    | Overview, Stages, Workflow, Practice, Files             |
+| `experiments/generation/<id>/run.json` | `generate` | Overview, Trace, Candidate, Files + **Upload to Freya** |
+| `experiments/<uuid>.json`              | `build`    | Overview, Candidate, Files                              |
+
+**All runs** is the default view: every run in one sortable table with its score, status, kind, model, and elapsed time, plus the mean across scored runs. This is the view for comparing runs across tasks before promoting a builder change.
+
+Opening a run gives:
+
+- **Overview** — the score at hero size with a per-case pass/fail strip, then failing cases first with the scorer's own reasons, then run configuration, git provenance, and model calls.
+- **Stages** — the `candidate → workflow → validation → registration → export → practice` timeline, with a proportional bar and each stage's share of total time.
+- **Workflow** — the compiled node graph laid out by distance from the initial node, colored by node type, with per-node prompts, tools, and transitions. Unreachable nodes, stranded exits, and transitions pointing at unknown nodes are flagged.
+- **Practice** — failing cases first with reasons, then every case with the tools it called.
+- **Trace** — the generation timeline: progress messages and model events with elapsed offsets.
+- **Files** — every artifact with its size, and a raw viewer for any of them.
+
+The page polls, so a run that is still in flight updates on its own. While any run reports `running` it refreshes every second and settles to every five seconds once everything finishes; a pulsing `running` badge marks live runs and elapsed time ticks from the start timestamp, since the record only stores a duration at the end.
+
+### Upload a generation to Freya
+
+A completed generation's page carries one action, **Upload to Freya**. It registers that run's `compiled.workflow.json` exactly as compiled, with **no further model call**: workspace verification → platform dry run → create-or-update → export, through the same unchanged organizer bridge a CLI run uses. The event model, tool bindings, and workflow document are untouched. It uploads only; practice testing stays a separate action.
+
+Repeats cannot create a second remote agent:
+
+| Guard                       | Effect                                                                              |
+| --------------------------- | ----------------------------------------------------------------------------------- |
+| Stable slot per generation  | The same generation always maps to the same remote workflow, so a repeat updates it |
+| Workspace-scoped slot state | `experiments/freya-state/<workspace>/slots.json` is shared with `pnpm run freya`    |
+| The existing workspace lock | An upload and a CLI run cannot register in the same workspace at once               |
+| Pending-create marker       | An uncertain create is refused until it is reconciled, not retried blindly          |
+| Recorded result             | An unchanged repeat returns the recorded registration with no platform call at all  |
+
+The result is written to `upload.json` beside the run, with the workflow and agent IDs, so it survives a refresh and appears under **Files**. A failure records which step stopped it. A changed `compiled.workflow.json` is registered into the same slot and published, rather than creating another agent.
+
+The endpoint is `POST /api/runs/<run-id>/upload`. It is the only non-GET route, and it stays inside the inspector's boundaries:
+
+- **Credentials stay server-side.** `FREYA_API_KEY` and the event package are read from the server process; the browser sends a run id and receives ids. Nothing served contains a key, and platform traces and exports stay redacted.
+- **Only discovered run ids.** The id must resolve through the inspector's own scan, and the workflow is read through that scan's artifact allowlist. A path or traversal is refused.
+- **Loopback and same-origin only.** A non-loopback peer, a cross-site `Sec-Fetch-Site`, or an `Origin` that does not match the `Host` header is refused before any platform call.
+- **A bounded deadline.** One operation budget covers verification, dry run, registration, and export; the lock is always released.
+- **Read-only otherwise.** Artifact and record routes stay GET-only and serve discovered names only.
+
+### UI stack
+
+The inspector is a React 19 app built with Vite and Tailwind v4, using components generated by the shadcn CLI in the `base-nova` style on **Base UI** primitives. `ui/components.json` pins that configuration.
+
+```sh
+pnpm run ui:build   # production bundle into ui/dist
+pnpm run ui:dev     # dev server with hot reload, API included
+cd ui && npx shadcn@latest add <component>   # add another component
+```
+
+`pnpm run ui:dev` starts the read-only API in-process and proxies `/api` to it, so it is a single command.
+
+Two things the generated `Sidebar` requires, both learned the hard way:
+
+- **Never put a width class on `<Sidebar>`.** The sidebar panel and the gap it reserves for the content are both sized from `--sidebar-width`. Setting `w-72` on `<Sidebar>` sizes only the panel, so the content starts 32px early and sits _behind_ the sidebar. Set the width on the provider instead:
+  ```tsx
+  <SidebarProvider style={{ '--sidebar-width': '18rem' } as React.CSSProperties}>
+  ```
+- Collapsed-mode content must hide itself with `group-data-[collapsible=icon]:hidden`, or it overflows the icon rail. Run items collapse to a status dot rather than a bare score, and the header collapses to a single live/idle glyph so the rail keeps no dead space. The sidebar collapses to a rail from the header trigger or `SidebarRail`, which is worth using when reading a wide workflow graph.
+
+`ui/dist` is build output and is Git-ignored. `src/ui/server.ts` serves whatever is in it and never imports the bundle, so the Node process keeps running TypeScript directly with no build step. Two tokens were added to the generated theme because the neutral base palette has no semantic success or warning colour:
+
+- `--success` / `--warning` in `ui/src/index.css`, exposed as `text-success`, `bg-success`, `text-warning`, and `bg-warning`.
+- `success` and `warning` variants on `Badge`, for run states that pass, warn, or fail.
+
+Add new run-outcome colours through those tokens rather than raw values, so light and dark stay consistent.
+
+Synthetic fixtures, the internal build baseline, and single-repetition practice runs are labeled in the UI. Structural checks and mock results are not benchmark scores, and the UI says so where they appear. Runs are deep-linkable: `#<run-id>` reopens one directly.
+
+## Inspect a run
+
+Each run creates a Git-ignored `experiments/<run-id>/` directory:
+
+| File                     | What to inspect                                                                                                         |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `run.json`               | Exact input/config/source versions, one model request/result, stage times, selected IDs, failures, and practice summary |
+| `compiled.workflow.json` | Locally compiled workflow before registration                                                                           |
+| `exported.workflow.json` | Platform-stored workflow in the organizer's export wrapper                                                              |
+| `practice.json`          | Case-level failures, tool names, call IDs, and practice totals                                                          |
+| `platform.jsonl`         | Platform/bank request and result trace, including retrieved call details                                                |
+| `upload.json`            | Recorded inspector upload: slot, workflow/agent IDs, the step it stopped at, and why                                    |
+
+Credentials remain in environment variables. Auth headers and credentials are excluded from platform traces and exports. Completed practice runs combine the original ledger scorer and conversation judge. A failed integration leaves a failed run record and a null score. A phone agent failing a case is still a completed evaluation; its failures are retained.
+
+One practice repetition is a development baseline, not the final three-repetition benchmark. Compare both A and B with the [experiment template](docs/experiment-template.md) before promoting any builder optimization.
+
+## Supporting code
+
+| File                                    | Responsibility                                                                |
+| --------------------------------------- | ----------------------------------------------------------------------------- |
+| `src/recipe.ts`                         | Builder instructions, budgets, and sequence                                   |
+| `src/ui/records.ts`, `src/ui/server.ts` | Read-only run discovery, normalization, and the loopback server               |
+| `src/ui/upload.ts`                      | The authorized upload: discovered artifact, stable slot, lock, and deadline   |
+| `ui/`                                   | React inspector: Vite, Tailwind, Base UI components from the shadcn CLI       |
+| `src/workflow.ts`                       | Read original inputs and compile tool references into event workflows         |
+| `src/providers.ts`                      | OpenAI Responses transport and request budget                                 |
+| `src/event.ts`                          | CLI orchestration, deadlines, state, and run records                          |
+| `src/freya.ts`, `src/freya_bridge.py`   | Bounded bridge to the unchanged organizer client and scorer                   |
+| `build-the-builder/`                    | Authoritative event package, documentation, briefs, tools, and practice cases |
+
+The compiler currently supports the event's POST JSON body operations, local OpenAPI references, conversation/API/code/end nodes, and end-of-call lifecycle tools. Unsupported schemas fail explicitly. Platform dry-run validation checks schema compatibility; structural validation cannot prove policy correctness.
+
+## Keep the original local baseline
+
+`recipe` in `src/recipe.ts` remains the original internal task → candidate → local specification baseline. Its `build` command does not create a Freya workflow:
+
+```sh
 pnpm run demo
-pnpm run suite
-pnpm run report
+# Optional live internal generation:
+node --env-file=.env src/cli.ts build \
+  --task fixtures/reschedule.json --provider openai
 ```
 
-Tests and default commands make **no network requests**. `demo` and `suite` create append-only JSON files in `experiments/`. Synthetic fixtures exercise plumbing, not agent intelligence. Their benchmark scores are `null`, never a fabricated pass rate.
+The demo uses an explicitly synthetic appointment-rescheduling fixture and fake model output. Tests use injected transports and make no network calls. Mock runs and structural checks are not benchmark scores.
 
-## What is implemented
-
-| Component                                    | Status                                                                                               |
-| -------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Direct task + tools → candidate generation   | Offline mock and OpenAI Responses implementations                                                    |
-| Planned generation                           | Optional extra structured planning call; original input retained                                     |
-| Structural validation                        | Required candidate fields, declared tool names, duplicate tools, basic input envelope                |
-| Semantic audit                               | Optional OpenAI Decisions predicates; report-only or bounded repair                                  |
-| Fallback                                     | Retains a materialized valid candidate when later repair, audit, budget, or timeout fails            |
-| Experiment runner                            | Sequential suites, repetitions, source snapshots, exact inputs/configuration, model requests/results |
-| Public Freya API                             | Defaults, workspaces, create, chat client methods; mocked tests only                                 |
-| Freya task-tool binding and final submission | Pending verified contract; explicit failure rather than fake success                                 |
-| Official benchmark evaluator                 | Interface prepared, not connected                                                                    |
-| Jev                                          | Not integrated; optional comparison after access and exact API review                                |
-
-## Internal input and output
-
-The JSON files in `fixtures/` demonstrate our own input envelope:
-
-```json
-{
-  "id": "a-task-id",
-  "description": "The original task specification",
-  "tools": [
-    {
-      "name": "exact_tool_name",
-      "description": "Original tool description",
-      "parameters": { "type": "object", "properties": {} }
-    }
-  ]
-}
-```
-
-Extra source fields are retained. Tool parameter schemas are preserved as opaque objects, not rewritten or fully validated. Event inputs may use a different format; adapt them at the boundary.
-
-The generated candidate contains `systemPrompt`, `toolNames`, `completionConditions`, and `uncertainties`. `systemPrompt` is the complete runtime policy; other fields help inspection and validation. All original tools remain in the local artifact, even if the generator omits a name in its declaration.
-
-Static validation checks declared tool names, **not every natural-language reference or argument in a prompt**. It cannot prove semantic correctness or enforce runtime prerequisites. A candidate marked `built` is structurally accepted locally; this is not evidence of task success or Freya acceptance.
-
-## Live generation
-
-Copy `.env.example` to `.env`, then fill in your key and a model you can access. Credentials stay in environment variables. Do not put secrets into task fixtures. Model choice is explicit, and no live call has been verified in this preparation session.
-
-```sh
-node --env-file=.env src/cli.ts build \
-  --task fixtures/reschedule.json \
-  --provider openai
-
-node --env-file=.env src/cli.ts build \
-  --task fixtures/reschedule.json \
-  --provider openai --strategy planned
-
-node --env-file=.env src/cli.ts build \
-  --task fixtures/reschedule.json \
-  --provider openai --audit report
-
-node --env-file=.env src/cli.ts build \
-  --task fixtures/reschedule.json \
-  --provider openai --audit repair --repairs 1 --max-calls 6
-```
-
-These commands make billable OpenAI calls and send the selected task/tool definitions to OpenAI. Generation uses Responses structured output with `store: false`. Decisions defaults to the documented `gpt-6-luna`; override with `DECISIONS_MODEL` or `--decisions-model` if the API changes.
-
-Default build limits are a 120-second wall-clock deadline, at most one repair, and six model requests per task. Failed requests count against the call budget. There are no hidden retries. Planned generation adds one call. A complete direct generate/audit/repair/re-audit cycle uses four calls; planned uses five. Reports include raw provider usage where returned; no guessed monetary totals are calculated.
-
-The default audit threshold of 0.8 is **an uncalibrated experimental setting**. Audit flags are model judgments, not benchmark labels. Report mode never repairs. Repair mode keeps the candidate with the lower maximum reported defect probability, preferring the earlier candidate on ties. This heuristic needs measurement against official scores before adoption.
-
-## Freya access preparation
-
-Public docs research is in [docs/freya-api-research.md](docs/freya-api-research.md). Once credentials are available, these probes only read platform state:
-
-```sh
-node --env-file=.env src/freya-cli.ts workspaces
-node --env-file=.env src/freya-cli.ts defaults --workspace YOUR_WORKSPACE_UUID
-```
-
-`FreyaClient.createAgent` and `.chat` are explicit library operations for later integration. They are not called by the builder CLI. Creating a prompt agent before task tools are wired is not a completed integration. The docs' create-agent example includes `workspaceId`, while the Body field list omits it; verify with participant access before depending on that request shape.
-
-The read-only probes redact credential-shaped fields in printed responses. Their output is an inspection view, not a config to upload unchanged. The library retains the original config in memory for deliberate integration.
-
-The builder's `PlatformAdapter.create` must remain a **pure local compilation step** because it can run for multiple candidates. Register only the selected artifact with the platform, outside this loop. `FreyaAdapter` currently fails explicitly until the submission/tool-binding contract is implemented.
-
-## Experiment records and reproduction
-
-Each run records the original task, candidate history, artifact, options, provider/model, total call cap, input and candidate hashes, Node version, elapsed time, request/response data, and an embedded source snapshot with its hash. The snapshot includes source files, package manifest/lockfile, runtime pin, and TypeScript config. Git commit and dirty state are added when a repository exists.
-
-`report` groups only matching source versions, inputs, model configurations, budgets, and evaluator sources. Unevaluated runs stay separate from real scores. It is a descriptive report, not statistical evidence of superiority.
-
-To reconstruct a run, restore the snapshot's `files` into a separate directory, save the recorded `task` as JSON, install with `pnpm install --frozen-lockfile`, and use its recorded CLI options and models. Secrets must be supplied separately. Exact requests can be reproduced; sampled model outputs may differ even with identical code and configuration.
-
-Experiment logs contain task and generated content and are ignored by Git. API auth headers are not logged. Keep these files local until sharing them is permitted.
-
-## Event-day work
-
-Follow [docs/event-runbook.md](docs/event-runbook.md): verify the contract, connect tool bindings and the evaluator, run the baseline, and then test one improvement at a time. Use [docs/experiment-template.md](docs/experiment-template.md) to record hypotheses and promotion decisions.
-
-API references checked on October 9, 2026:
-
-- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
-- [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions)
-- [Freya documentation](https://docs.freyavoice.ai/)
-
-## Verification limits
-
-Offline tests cover parsing, budgets, deadlines, fallbacks, response handling, source logging, and mocked HTTP contracts. They do not establish live API access, Freya tool compatibility, semantic agent quality, or benchmark performance. No agents have been created or simulations run against Freya.
+For the event contract, start with the [research index](docs/hackathon-research-index.md) and [official kit v3 findings](docs/starter-kit-v3-2026-10-10.md). Verify current organizer updates and the actual package at event start and submission freeze.

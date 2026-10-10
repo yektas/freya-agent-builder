@@ -1,44 +1,64 @@
 import { parseArgs } from 'node:util';
-import { readFile, readdir } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { build, defaultOptions } from './builder.ts';
 import { LocalAdapter } from './adapter.ts';
 import { parseTask } from './validation.ts';
-import { DecisionsAuditor, MockGenerator, OpenAIClient, OpenAIGenerator } from './providers.ts';
-import { evaluate, hash, report, saveRun, sourceSnapshot } from './experiments.ts';
-import type { BuildOptions } from './contracts.ts';
+import { MockGenerator, OpenAIGenerator } from './providers.ts';
+import { hash, saveRun, sourceSnapshot } from './experiments.ts';
+import { recipe } from './recipe.ts';
+import { freyaRecipe } from './recipe.ts';
+import { generateFreyaJson, runFreya } from './event.ts';
+import { startUi } from './ui/server.ts';
 
-const help = `Freya builder preparation kit (internal contracts; local artifact only)
+const help = `Freya builder
 
-node src/cli.ts doctor
+pnpm run generate            print Brief A workflow JSON and save a local trace; no Freya calls
+pnpm run generate --brief-file FILE   use another brief (repeat for additive briefs)
+
+pnpm run ui                  browse recorded runs; read-only, plus the upload action below
+
 node src/cli.ts build --task fixtures/reschedule.json
-node src/cli.ts suite --tasks fixtures --repeat 2
-node src/cli.ts report --out experiments
+node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \\
+  --brief-file build-the-builder/briefs/brief-a.md --practice-brief A --slot brief-a
+
+Freya options (live generation, registration, official practice, export):
+  --json-only                 print locally compiled workflow JSON and stop; OpenAI only
+  --quiet                     hide generation progress (JSON-only mode)
+  --show-draft                stream unvalidated model JSON to stderr (JSON-only mode)
+  --reasoning-summary         request model-provided summaries if supported (JSON-only mode)
+  --brief-file FILE           repeat for additive briefs (A + B)
+  --openapi FILE              default: build-the-builder/tools/openapi.json
+  --kit DIRECTORY             default: build-the-builder
+  --slot NAME                 stable slot; later runs update and publish it
+  --practice-brief A|B         filter official cases; omitted runs all cases
+  --only CASE_ID,...           optional practice subset
+  --style STYLE               pieces|corrects|talkative|asks_back|in_words
+  --timeout-ms 1800000         total Freya run deadline (30 minutes maximum)
 
 Options:
   --provider mock|openai       mock by default; openai makes billable requests
   --model MODEL               or BUILDER_MODEL; required for openai
-  --strategy direct|planned   direct by default
-  --audit off|report|repair    off by default; Decisions requires openai
-  --decisions-model MODEL     or DECISIONS_MODEL (default gpt-6-luna)
-  --threshold 0.8             experimental, uncalibrated audit threshold
-  --repairs 1                 maximum repair calls, 0–3
-  --max-calls 6               total model requests per task, including audits
-  --timeout-ms 120000         total build deadline per task
-  --repeat 1                  repetitions per fixture, 1–100
+  --timeout-ms ${recipe.limits.timeoutMs}         total build deadline, up to 1800000 ms
   --out experiments           append-only run records with source snapshots
 
-Load credentials with node --env-file=.env src/cli.ts ...
-No API calls are made by doctor, mock runs, tests, or report.
-`;
+Inspector options (ui command):
+  --out experiments           directory of run records to browse
+  --port 4317                 HTTP port on the loopback interface
+  --host 127.0.0.1            bind address; loopback only by default
+  --kit DIRECTORY             event package used by the upload action
 
-function integer(value: string, name: string, min: number, max: number) {
-  const number = Number(value);
-  if (!Number.isInteger(number) || number < min || number > max) {
-    throw new Error(`${name} must be an integer from ${min} to ${max}.`);
-  }
-  return number;
-}
+Upload from the inspector (ui command):
+  A completed generation's compiled.workflow.json can be registered on Freya
+  without another model call: platform dry run, then create-or-update, then
+  export. FREYA_API_KEY and the event package are read from this process; the
+  browser never receives a credential. Each generation owns one stable slot, so
+  a repeated click returns the recorded registration instead of creating a second
+  remote agent. Upload only; practice testing remains a separate action.
+
+Load credentials with node --env-file=.env src/cli.ts ...
+Mock runs and tests make no API calls.
+`;
 
 async function main() {
   const { values, positionals } = parseArgs({
@@ -46,152 +66,146 @@ async function main() {
     options: {
       help: { type: 'boolean' },
       task: { type: 'string' },
-      tasks: { type: 'string' },
       out: { type: 'string', default: 'experiments' },
       provider: { type: 'string', default: 'mock' },
       model: { type: 'string' },
-      strategy: { type: 'string', default: 'direct' },
-      audit: { type: 'string', default: 'off' },
-      'decisions-model': { type: 'string' },
-      threshold: { type: 'string', default: '0.8' },
-      repairs: { type: 'string', default: '1' },
-      'max-calls': { type: 'string', default: '6' },
-      'timeout-ms': { type: 'string', default: '120000' },
-      repeat: { type: 'string', default: '1' },
+      'timeout-ms': { type: 'string', default: String(defaultOptions.timeoutMs) },
+      'brief-file': { type: 'string', multiple: true },
+      openapi: { type: 'string' },
+      kit: { type: 'string', default: 'build-the-builder' },
+      slot: { type: 'string' },
+      'practice-brief': { type: 'string' },
+      only: { type: 'string' },
+      style: { type: 'string' },
+      'json-only': { type: 'boolean' },
+      quiet: { type: 'boolean' },
+      'show-draft': { type: 'boolean' },
+      'reasoning-summary': { type: 'boolean' },
+      port: { type: 'string', default: '4317' },
+      host: { type: 'string', default: '127.0.0.1' },
     },
   });
   if (values.help || !positionals.length) {
     console.log(help);
     return;
   }
-  if (positionals.length !== 1) {
-    throw new Error('Supply exactly one command.');
+  if (positionals.length !== 1 || !['build', 'freya', 'ui'].includes(positionals[0])) {
+    throw new Error('Supply the build, freya, or ui command. Use --help.');
   }
-  const command = positionals[0];
-  if (command === 'doctor') {
-    console.log(
-      JSON.stringify(
-        {
-          node: process.version,
-          requiredNode: '>=22.18.0',
-          openaiKeyPresent: !!process.env.OPENAI_API_KEY?.trim(),
-          builderModel: process.env.BUILDER_MODEL || null,
-          freyaAdapter: 'not configured',
-          officialBenchmark: 'not connected',
-          networkChecked: false,
-        },
-        null,
-        2,
+  if (positionals[0] === 'ui') {
+    const port = Number(values.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('ui port must be an integer from 1 to 65535.');
+    }
+    // The inspector only reads recorded files. Upload is the one authorized
+    // write, so the credentials stay in this process and the action asks for a
+    // discovered run id, never for a path or a key.
+    startUi({
+      root: resolve(values.out!),
+      port,
+      host: values.host!,
+      upload: { root: resolve(values.out!), kit: resolve(values.kit!) },
+    });
+    return;
+  }
+  if (positionals[0] === 'freya') {
+    if (values['json-only']) {
+      const workflow = await generateFreyaJson({
+        briefs: values['brief-file'] || [resolve(values.kit!, 'briefs/brief-a.md')],
+        openapi: values.openapi || resolve(values.kit!, 'tools/openapi.json'),
+        kit: values.kit!,
+        model: values.model || process.env.BUILDER_MODEL || '',
+        timeoutMs: Number(
+          process.argv.includes('--timeout-ms') ||
+            process.argv.some((arg) => arg.startsWith('--timeout-ms='))
+            ? values['timeout-ms']
+            : freyaRecipe.limits.generationTimeoutMs,
+        ),
+        quiet: values.quiet,
+        showDraft: values['show-draft'],
+        reasoningSummary: values['reasoning-summary'],
+        out: values.out,
+      });
+      console.log(JSON.stringify(workflow, null, 2));
+      return;
+    }
+    const briefs = values['brief-file'] || [];
+    if (!briefs.length || !values.slot) {
+      throw new Error('freya requires --brief-file FILE and --slot NAME.');
+    }
+    const result = await runFreya({
+      briefs,
+      openapi: values.openapi || resolve(values.kit!, 'tools/openapi.json'),
+      kit: values.kit!,
+      slot: values.slot,
+      out: values.out!,
+      brief: values['practice-brief'],
+      only: values.only,
+      style: values.style,
+      timeoutMs: Number(
+        process.argv.includes('--timeout-ms') ||
+          process.argv.some((arg) => arg.startsWith('--timeout-ms='))
+          ? values['timeout-ms']
+          : freyaRecipe.limits.timeoutMs,
       ),
-    );
+      model: values.model || process.env.BUILDER_MODEL || '',
+    });
+    console.log(JSON.stringify(result));
+    if (result.status === 'failed') {
+      process.exitCode = 1;
+    }
     return;
   }
-  if (command === 'report') {
-    console.log(JSON.stringify(await report(resolve(values.out!)), null, 2));
-    return;
+  if (values['json-only']) {
+    throw new Error('--json-only is supported only by the freya command.');
   }
-  if (command !== 'build' && command !== 'suite') {
-    throw new Error('Unknown command. Use --help.');
+  if (!values.task) {
+    throw new Error('build requires --task FILE.');
   }
   if (!['mock', 'openai'].includes(values.provider!)) {
     throw new Error('provider must be mock or openai.');
-  }
-  if (!['direct', 'planned'].includes(values.strategy!)) {
-    throw new Error('strategy must be direct or planned.');
-  }
-  if (!['off', 'report', 'repair'].includes(values.audit!)) {
-    throw new Error('audit must be off, report, or repair.');
-  }
-  if (values.provider === 'mock' && values.audit !== 'off') {
-    throw new Error('Decisions audit requires --provider openai.');
   }
   const model = values.model || process.env.BUILDER_MODEL;
   if (values.provider === 'openai' && (!model?.trim() || !process.env.OPENAI_API_KEY?.trim())) {
     throw new Error('Live runs require OPENAI_API_KEY and --model or BUILDER_MODEL.');
   }
-  const maxCalls = integer(values['max-calls']!, 'max-calls', 1, 100);
-  const repeat = integer(values.repeat!, 'repeat', 1, 100);
-  const threshold = Number(values.threshold);
-  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
-    throw new Error('threshold must be from 0 to 1.');
+  const timeoutMs = Number(values['timeout-ms']);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 1800000) {
+    throw new Error('timeout-ms must be an integer from 1 to 1800000.');
   }
-  const options: BuildOptions = {
-    ...defaultOptions,
-    strategy: values.strategy as BuildOptions['strategy'],
-    auditMode: values.audit as BuildOptions['auditMode'],
-    maxRepairs: integer(values.repairs!, 'repairs', 0, 3),
-    timeoutMs: integer(values['timeout-ms']!, 'timeout-ms', 1, 3600000),
-    auditThreshold: threshold,
-  };
-  if (command === 'build' && !values.task) {
-    throw new Error('build requires --task FILE.');
-  }
-  if (command === 'suite' && !values.tasks) {
-    throw new Error('suite requires --tasks DIRECTORY.');
-  }
-  const files =
-    command === 'build'
-      ? [resolve(values.task!)]
-      : (await readdir(values.tasks!))
-          .filter((name) => name.endsWith('.json'))
-          .sort()
-          .map((name) => resolve(join(values.tasks!, name)));
-  if (!files.length) {
-    throw new Error('No task JSON files found.');
-  }
-  // Parse the complete suite before making any model calls.
-  const tasks = await Promise.all(
-    files.map(async (file) => parseTask(JSON.parse(await readFile(file, 'utf8')))),
-  );
-  if (new Set(tasks.map((task) => task.id)).size !== tasks.length) {
-    throw new Error('Suite contains duplicate task IDs.');
-  }
+  const options = { timeoutMs };
+  const task = parseTask(JSON.parse(await readFile(resolve(values.task), 'utf8')));
   const source = await sourceSnapshot();
-  const decisionsModel = values['decisions-model'] || process.env.DECISIONS_MODEL || 'gpt-6-luna';
-  for (let repetition = 0; repetition < repeat; repetition++) {
-    for (const task of tasks) {
-      const client =
-        values.provider === 'openai'
-          ? new OpenAIClient(process.env.OPENAI_API_KEY!, maxCalls)
-          : undefined;
-      const generator = client ? new OpenAIGenerator(client, model!) : new MockGenerator();
-      const auditor =
-        client && options.auditMode !== 'off'
-          ? new DecisionsAuditor(client, decisionsModel)
-          : undefined;
-      const started = performance.now();
-      const result = await build(task, generator, new LocalAdapter(), options, auditor);
-      const evaluation = await evaluate(undefined, task, result.artifact, options.timeoutMs);
-      const path = await saveRun(resolve(values.out!), {
-        task,
-        inputHash: hash(task),
-        candidateHash: result.candidate ? hash(result.candidate) : null,
-        source,
-        nodeVersion: process.version,
-        provider: values.provider!,
-        model: client ? model! : null,
-        decisionsModel: auditor ? decisionsModel : null,
-        maxCalls,
-        options,
-        elapsedMs: Math.round(performance.now() - started),
-        build: result,
-        calls: client?.calls ?? [],
-        evaluation,
-      });
-      console.log(
-        JSON.stringify({
-          taskId: task.id,
-          repetition: repetition + 1,
-          status: result.status,
-          score: evaluation.score,
-          path,
-          error: result.error,
-        }),
-      );
-      if (result.status === 'failed') {
-        process.exitCode = 1;
-      }
-    }
+  const generator =
+    values.provider === 'openai'
+      ? new OpenAIGenerator(process.env.OPENAI_API_KEY!, model!)
+      : new MockGenerator();
+  const started = performance.now();
+  const result = await build(task, generator, new LocalAdapter(), options);
+  const path = await saveRun(resolve(values.out!), {
+    task,
+    inputHash: hash(task),
+    candidateHash: result.candidate ? hash(result.candidate) : null,
+    source,
+    nodeVersion: process.version,
+    provider: values.provider!,
+    model: generator instanceof OpenAIGenerator ? generator.model : null,
+    maxCalls: recipe.limits.maxCalls,
+    options,
+    elapsedMs: Math.round(performance.now() - started),
+    build: result,
+    calls: generator instanceof OpenAIGenerator ? generator.calls : [],
+    evaluation: {
+      score: null,
+      source: 'not-evaluated',
+      details: 'Local structural validation only; no official benchmark has run.',
+    },
+  });
+  console.log(
+    JSON.stringify({ taskId: task.id, status: result.status, path, error: result.error }),
+  );
+  if (result.status === 'failed') {
+    process.exitCode = 1;
   }
 }
 

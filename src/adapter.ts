@@ -12,11 +12,3 @@ export class LocalAdapter implements PlatformAdapter {
     };
   }
 }
-
-export class FreyaAdapter implements PlatformAdapter {
-  async create(): Promise<never> {
-    throw new Error(
-      'Freya submission adapter is not configured. Verify event input/output and tool binding before enabling it.',
-    );
-  }
-}

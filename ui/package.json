@@ -1,0 +1,12 @@
+{
+  "name": "freya-inspector-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "cn": "^0.4.0"
+  }
+}
