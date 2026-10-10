@@ -1,12 +1,15 @@
 // Human-readable progress goes to stderr; stdout remains the final workflow JSON.
 import type { ModelEvent } from './providers.ts';
 import { object } from './validation.ts';
+import { estimateCost, normalizeUsage } from './usage.ts';
 
 export function generationProgress(
   options: {
+    provider?: string;
     quiet?: boolean;
     showDraft?: boolean;
     reasoningSummary?: boolean;
+    model?: string;
   },
   onLog?: (message: string) => void,
 ) {
@@ -62,7 +65,9 @@ export function generationProgress(
       heartbeat = setInterval(
         () =>
           report(
-            `Waiting for model completion; ${outputChars.toLocaleString('en-US')} draft characters received.`,
+            options.provider === 'codex'
+              ? 'Waiting for Codex completion; the CLI returns workflow text when its message completes.'
+              : `Waiting for model completion; ${outputChars.toLocaleString('en-US')} draft characters received.`,
           ),
         10000,
       );
@@ -70,8 +75,15 @@ export function generationProgress(
     },
     model(event: ModelEvent) {
       switch (event.kind) {
+        case 'status':
+          report(event.reason ?? 'Codex reported activity.');
+          break;
         case 'accepted':
-          report('OpenAI accepted the request.');
+          report(
+            options.provider === 'codex'
+              ? 'Codex started generation.'
+              : 'Responses API accepted the request.',
+          );
           break;
         case 'reasoning':
           report('Model is reasoning; private internal text is not exposed.');
@@ -106,8 +118,13 @@ export function generationProgress(
             typeof details.reasoning_tokens === 'number'
               ? ` Reasoning tokens: ${details.reasoning_tokens} (included in output tokens).`
               : '';
+          const cost = estimateCost(normalizeUsage(event.usage), options.model);
+          const spend =
+            cost.usd !== null
+              ? ` Estimated cost: $${cost.usd.toFixed(6)} (${cost.source} price).`
+              : '';
           report(
-            `Model response ${event.kind}.${event.reason ? ` Reason: ${event.reason}.` : ''}${tokens}${reasoning}`,
+            `Model response ${event.kind}.${event.reason ? ` Reason: ${event.reason}.` : ''}${tokens}${reasoning}${spend}`,
           );
           if (options.reasoningSummary && !summaryChars) {
             report('No model-provided reasoning summary was returned.');

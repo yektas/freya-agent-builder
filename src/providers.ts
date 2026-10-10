@@ -1,22 +1,57 @@
 import type { Candidate, Generator, Task } from './contracts.ts';
 import { candidateSchema, object } from './validation.ts';
 import { recipe } from './recipe.ts';
+import { normalizeUsage } from './usage.ts';
+import type { TokenUsage } from './usage.ts';
 
 export type CallRecord = {
   endpoint: string;
+  baseUrl?: string;
   request: unknown;
   response?: unknown;
   error?: string;
   elapsedMs: number;
+  // Normalized from whichever shape the provider reported, so every run record
+  // totals the same way regardless of provider.
+  usage?: TokenUsage;
 };
 
 export type ModelEvent = {
-  kind: 'accepted' | 'reasoning' | 'summary' | 'draft' | 'completed' | 'incomplete' | 'failed';
+  kind:
+    | 'accepted'
+    | 'reasoning'
+    | 'summary'
+    | 'draft'
+    | 'completed'
+    | 'incomplete'
+    | 'failed'
+    | 'status';
   text?: string;
   usage?: unknown;
   reason?: string;
 };
-type GenerationDefinition = {
+export const reasoningEfforts = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+] as const;
+export type ReasoningEffort = (typeof reasoningEfforts)[number];
+export function parseReasoningEffort(value: string | undefined): ReasoningEffort | undefined {
+  if (value === undefined || value === '') {
+    return undefined;
+  }
+  if (!reasoningEfforts.includes(value as ReasoningEffort)) {
+    throw new Error(`reasoning-effort must be one of: ${reasoningEfforts.join(', ')}.`);
+  }
+  return value as ReasoningEffort;
+}
+
+export type GenerationDefinition = {
   instructions: string;
   schema: unknown;
   maxOutputTokens: number;
@@ -24,6 +59,7 @@ type GenerationDefinition = {
   onEvent?: (event: ModelEvent) => void;
   onCall?: (call: CallRecord) => void;
   reasoningSummary?: boolean;
+  reasoningEffort?: ReasoningEffort;
 };
 
 export class OpenAIGenerator implements Generator {
@@ -32,6 +68,7 @@ export class OpenAIGenerator implements Generator {
   model: string;
   transport: typeof fetch;
   definition: GenerationDefinition;
+  baseUrl: string;
   constructor(
     apiKey: string,
     model: string,
@@ -42,6 +79,7 @@ export class OpenAIGenerator implements Generator {
       maxOutputTokens: recipe.limits.maxOutputTokens,
       maxCalls: recipe.limits.maxCalls,
     },
+    baseUrl = 'https://api.openai.com/v1',
   ) {
     if (!apiKey.trim()) {
       throw new Error('OPENAI_API_KEY is required for live calls.');
@@ -49,10 +87,32 @@ export class OpenAIGenerator implements Generator {
     if (!model.trim()) {
       throw new Error('BUILDER_MODEL must be explicitly configured.');
     }
+    parseReasoningEffort(definition.reasoningEffort);
+    if (definition.reasoningEffort === 'ultra') {
+      throw new Error('reasoning-effort ultra is supported only by the codex provider.');
+    }
     this.apiKey = apiKey;
     this.model = model;
     this.transport = transport;
     this.definition = definition;
+    let url: URL;
+    try {
+      url = new URL(baseUrl);
+    } catch {
+      throw new Error('OPENAI_BASE_URL must be an absolute HTTP or HTTPS URL.');
+    }
+    if (
+      !['http:', 'https:'].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      throw new Error(
+        'OPENAI_BASE_URL must use HTTP or HTTPS without credentials, query parameters, or a fragment.',
+      );
+    }
+    this.baseUrl = url.href.replace(/\/+$/, '');
   }
   async generate(task: Task, signal: AbortSignal): Promise<unknown> {
     const request = {
@@ -62,7 +122,16 @@ export class OpenAIGenerator implements Generator {
       input: JSON.stringify({ task }),
       max_output_tokens: this.definition.maxOutputTokens,
       ...(this.definition.onEvent ? { stream: true } : {}),
-      ...(this.definition.reasoningSummary ? { reasoning: { summary: 'auto' } } : {}),
+      ...(this.definition.reasoningSummary || this.definition.reasoningEffort
+        ? {
+            reasoning: {
+              ...(this.definition.reasoningSummary ? { summary: 'auto' } : {}),
+              ...(this.definition.reasoningEffort
+                ? { effort: this.definition.reasoningEffort }
+                : {}),
+            },
+          }
+        : {}),
       text: {
         format: {
           type: 'json_schema',
@@ -77,11 +146,16 @@ export class OpenAIGenerator implements Generator {
       throw new Error('Model call budget exhausted.');
     }
     const started = performance.now();
-    const call: CallRecord = { endpoint: 'responses', request, elapsedMs: 0 };
+    const call: CallRecord = {
+      endpoint: 'responses',
+      baseUrl: this.baseUrl,
+      request,
+      elapsedMs: 0,
+    };
     this.calls.push(call);
     try {
       this.definition.onCall?.(call);
-      const response = await this.transport('https://api.openai.com/v1/responses', {
+      const response = await this.transport(`${this.baseUrl}/responses`, {
         method: 'POST',
         redirect: 'error',
         signal,
@@ -90,7 +164,7 @@ export class OpenAIGenerator implements Generator {
       });
       // Do not echo server error bodies: they can contain request data or credentials.
       if (!response.ok) {
-        throw new Error(`OpenAI responses HTTP ${response.status}`);
+        throw new Error(`Responses API HTTP ${response.status}`);
       }
       const emit = (event: ModelEvent) =>
         this.definition.onEvent?.({
@@ -102,6 +176,12 @@ export class OpenAIGenerator implements Generator {
         ? await streamedResponse(response, emit, signal)
         : await response.json();
       call.response = result;
+      // Record usage before any validation can throw, so a rejected or
+      // truncated response still reports what it cost.
+      const usage = normalizeUsage(object(result) ? result.usage : undefined);
+      if (usage) {
+        call.usage = usage;
+      }
       if (object(result) && (result.status === 'incomplete' || result.status === 'failed')) {
         emit({ kind: result.status, reason: incompleteReason(result), usage: result.usage });
       }

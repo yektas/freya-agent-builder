@@ -1,7 +1,6 @@
-// Local HTTP server for the run inspector. It reads recorded files and never
-// writes them; the single exception is the explicitly authorized upload action,
-// which registers an already compiled workflow on Freya. It binds to loopback so
-// experiment records stay local, and holds no credentials of its own.
+// Local HTTP server for the run inspector. Recorded files stay read-only; the
+// authorized actions start a local generation or upload a compiled workflow to
+// Freya. It binds to loopback and keeps credentials in the server process.
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -11,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { listRuns, loadRun, readRunFile } from './records.ts';
 import { UploadError, uploadAvailability, uploadRun } from './upload.ts';
 import type { UploadOptions } from './upload.ts';
+import { GenerateError, generationAvailability, startGeneration } from './generate.ts';
+import type { GenerationOptions } from './generate.ts';
 
 export type UiOptions = {
   root: string;
@@ -21,13 +22,19 @@ export type UiOptions = {
    * which is the safe default for a read-only browsing session.
    */
   upload?: UploadOptions | null;
+  /**
+   * Generation configuration. Omitted means the inspector cannot start a run,
+   * which is the safe default for a read-only browsing session.
+   */
+  generation?: GenerationOptions | null;
 };
 
 // Built by `pnpm run ui:build`; absent in a fresh checkout until then.
 const bundle = fileURLToPath(new URL('../../ui/dist', import.meta.url));
 
 // The upload action takes no request body; anything sent is discarded under a
-// bound so an unexpected payload is never buffered.
+// bound so an unexpected payload is never buffered. The generate action takes a
+// small JSON body of three choices, read under the same bound.
 const MAX_UPLOAD_BODY = 8192;
 
 const MIME: Record<string, string> = {
@@ -101,6 +108,26 @@ async function route(options: UiOptions, url: URL, response: ServerResponse) {
     sendJson(response, 200, availability);
     return;
   }
+  if (path === '/api/generate') {
+    // What the dialog may choose, and whether either provider can run. Reports
+    // presence of credentials, never their values.
+    sendJson(
+      response,
+      200,
+      options.generation
+        ? await generationAvailability(options.generation)
+        : {
+            available: false,
+            problem: 'This inspector was started without generation configuration.',
+            providers: [],
+            models: { openai: [], codex: [] },
+            reasoningEfforts: [],
+            timeoutMs: 0,
+            running: null,
+          },
+    );
+    return;
+  }
   const run = /^\/api\/runs\/([^/]+)$/.exec(path);
   if (run) {
     const detail = await loadRun(root, run[1]);
@@ -171,21 +198,56 @@ async function discardBody(request: IncomingMessage): Promise<boolean> {
   return true;
 }
 
-// The one authorized write: register an already compiled workflow. Credentials
-// stay in this process, the run id must be one the scan discovered, and the
-// operation runs under a bounded deadline.
+// Reads a small JSON body under the same bound. An oversized or malformed body
+// is refused rather than parsed, so a request can never dictate how much this
+// process buffers or how deep it reads.
+async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown> | null> {
+  let size = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_UPLOAD_BODY) {
+      return null;
+    }
+    chunks.push(chunk as Buffer);
+  }
+  if (!size) {
+    return {};
+  }
+  try {
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// Guards every authorized write. The bind address is already loopback; these
+// refuse a proxied connection and a cross-site request.
+function refuseWrite(request: IncomingMessage, response: ServerResponse, what: string): boolean {
+  if (!isLoopback(request.socket.remoteAddress)) {
+    sendJson(response, 403, { error: `${what} accepts loopback requests only.` });
+    return true;
+  }
+  if (!isSameOrigin(request)) {
+    sendJson(response, 403, { error: `Cross-origin ${what.toLowerCase()} requests are refused.` });
+    return true;
+  }
+  return false;
+}
+
+// The one authorized write that registers remotely: register an already
+// compiled workflow. Credentials stay in this process, the run id must be one
+// the scan discovered, and the operation runs under a bounded deadline.
 async function handleUpload(
   options: UiOptions,
   request: IncomingMessage,
   response: ServerResponse,
   runId: string,
 ) {
-  if (!isLoopback(request.socket.remoteAddress)) {
-    sendJson(response, 403, { error: 'Upload accepts loopback requests only.' });
-    return;
-  }
-  if (!isSameOrigin(request)) {
-    sendJson(response, 403, { error: 'Cross-origin upload requests are refused.' });
+  if (refuseWrite(request, response, 'Upload')) {
     return;
   }
   const config = options.upload;
@@ -208,6 +270,41 @@ async function handleUpload(
   }
 }
 
+// The second authorized write: start one generation with the provider, model,
+// and reasoning effort chosen in the browser. It runs the same generation a CLI
+// `generate` runs, under the same recipe deadline, and answers with the run id
+// so the inspector can navigate to the trace it is already writing.
+async function handleGenerate(
+  options: UiOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+) {
+  if (refuseWrite(request, response, 'Generation')) {
+    return;
+  }
+  const config = options.generation;
+  if (!config) {
+    sendJson(response, 503, {
+      error: 'This inspector was started without generation configuration.',
+    });
+    return;
+  }
+  const body = await readJsonBody(request);
+  if (!body) {
+    sendJson(response, 413, { error: 'Generation takes a small JSON body of choices only.' });
+    return;
+  }
+  try {
+    sendJson(response, 202, { run: await startGeneration(config, body) });
+  } catch (error) {
+    if (error instanceof GenerateError) {
+      sendJson(response, error.status, { error: error.message });
+      return;
+    }
+    sendJson(response, 500, { error: 'Generation could not be started.' });
+  }
+}
+
 // A malformed percent escape must not escape the request handler.
 function safePath(url: URL): string {
   try {
@@ -220,7 +317,8 @@ function safePath(url: URL): string {
 export function createUiServer(options: UiOptions) {
   return createServer((request: IncomingMessage, response: ServerResponse) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
-    const upload = /^\/api\/runs\/([^/]+)\/upload$/.exec(safePath(url));
+    const path = safePath(url);
+    const upload = /^\/api\/runs\/([^/]+)\/upload$/.exec(path);
     if (request.method === 'POST' && upload) {
       handleUpload(options, request, response, upload[1]).catch(() => {
         if (!response.headersSent) {
@@ -229,10 +327,19 @@ export function createUiServer(options: UiOptions) {
       });
       return;
     }
+    if (request.method === 'POST' && path === '/api/generate') {
+      handleGenerate(options, request, response).catch(() => {
+        if (!response.headersSent) {
+          sendJson(response, 500, { error: 'Generation could not be started.' });
+        }
+      });
+      return;
+    }
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      // Recorded runs stay read-only; POST is accepted only on the upload route.
+      // Recorded runs stay read-only; POST is accepted only on the two
+      // authorized actions, upload and generation.
       sendJson(response, 405, {
-        error: 'The inspector is read-only except for the upload action.',
+        error: 'The inspector is read-only except for the upload and generation actions.',
       });
       return;
     }

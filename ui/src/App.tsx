@@ -12,7 +12,7 @@ import { StagesTab, WorkflowTab } from '@/components/tabs';
 import { CandidateTab, FilesTab, TraceTab } from '@/components/simple-tabs';
 import { UploadAction } from '@/components/upload-action';
 import { isRunning, kindLabel, when } from '@/lib/data';
-import type { RunDetail, RunSummary } from '@/lib/data';
+import type { RunDetail, RunSummary, StartedRun } from '@/lib/data';
 import { usePoller } from '@/lib/hooks';
 
 const fetchRuns = async (): Promise<{ runs: RunSummary[] }> => {
@@ -149,6 +149,12 @@ export function App() {
     setDetail(null);
     location.hash = '';
   };
+  // A started run is addressed by the same id the list uses, so it opens
+  // immediately and keeps streaming into view while the model is still writing.
+  const started = React.useCallback((run: StartedRun) => {
+    back();
+    select(`generation~${run.runId}`);
+  }, []);
 
   const visible = filter === 'all' ? runs : runs.filter((r) => r.kind === filter);
 
@@ -170,7 +176,9 @@ export function App() {
         />
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           {error && <p className="p-4 text-xs text-destructive">{error}</p>}
-          {!id && !error && <RunTable runs={visible} selected={id} onSelect={select} />}
+          {!id && !error && (
+            <RunTable runs={visible} selected={id} onSelect={select} onStarted={started} />
+          )}
           {id && !detail && (
             <p className="p-10 text-center text-xs text-muted-foreground">Loading run…</p>
           )}

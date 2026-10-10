@@ -2,7 +2,7 @@ import * as React from 'react';
 import { AlertTriangle, ChevronRight, Info } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { ScoreStrip, StatusDot } from '@/lib/hooks';
-import { isRunning, ms, scoreTone, TONE_TEXT, when } from '@/lib/data';
+import { isRunning, ms, scoreTone, tokens, TONE_TEXT, usd, when } from '@/lib/data';
 import type { PracticeCase, RunDetail } from '@/lib/data';
 import { cn } from '@/lib/utils';
 
@@ -176,6 +176,34 @@ export function OverviewTab({ detail }: { detail: RunDetail }) {
           </Fact>
           <Fact label="started">{when(s.startedAt)}</Fact>
           <Fact label="model">{s.model ?? '—'}</Fact>
+          {s.usage && s.usage.totalTokens > 0 && (
+            <Fact label="tokens">
+              {tokens(s.usage.totalTokens)}
+              <span className="text-muted-foreground">
+                {' '}
+                ({tokens(s.usage.inputTokens)} in · {tokens(s.usage.outputTokens)} out
+                {s.usage.reasoningTokens > 0 ? ` · ${tokens(s.usage.reasoningTokens)} rsn` : ''})
+              </span>
+              {/* Cache reads and writes bill at their own rates, so they explain
+                  why two runs with the same totals cost different amounts. */}
+              {s.usage.cachedInputTokens > 0 && (
+                <div className="text-[10px] text-muted-foreground">
+                  {tokens(s.usage.cachedInputTokens)} cached read
+                </div>
+              )}
+              {s.usage.cacheWriteTokens > 0 && (
+                <div className="text-[10px] text-muted-foreground">
+                  {tokens(s.usage.cacheWriteTokens)} cache write
+                </div>
+              )}
+            </Fact>
+          )}
+          {s.usage?.usd !== null && s.usage && (
+            <Fact label="cost">
+              {usd(s.usage.usd)}
+              <span className="text-muted-foreground"> {s.usage.costSource}</span>
+            </Fact>
+          )}
           {s.slot && <Fact label="slot">{s.slot}</Fact>}
           {/* The heading already names the brief when they are the same. */}
           {s.taskId && s.taskId !== s.title && <Fact label="brief">{s.taskId}</Fact>}
@@ -256,6 +284,19 @@ export function OverviewTab({ detail }: { detail: RunDetail }) {
                         ms(call.elapsedMs)
                       )}
                     </td>
+                    <td className="py-1 pl-3 font-mono tabular-nums">
+                      {call.usage ? (
+                        <>
+                          {tokens(call.usage.inputTokens)} in · {tokens(call.usage.outputTokens)}{' '}
+                          out
+                          {call.usd !== null && (
+                            <span className="text-muted-foreground"> · {usd(call.usd)}</span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </td>
                     <td className="py-1 pl-3 text-muted-foreground">
                       {call.error ? (
                         <span className="text-destructive">{call.error}</span>
@@ -272,6 +313,13 @@ export function OverviewTab({ detail }: { detail: RunDetail }) {
               })}
             </tbody>
           </table>
+          {s.usage?.usd !== null && s.usage && (
+            <p className="mt-2 border-t border-border/40 pt-2 text-[11px] text-muted-foreground">
+              Cost is an estimate from published per-model rates
+              {s.usage.costSource === 'estimated' ? ' applied to this run after the fact' : ''}, not
+              a billed figure. Cached reads and cache writes are billed at their own rates.
+            </p>
+          )}
         </Disclosure>
       )}
     </div>

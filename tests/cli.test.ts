@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { projectRoot } from '../src/experiments.ts';
@@ -26,6 +26,8 @@ test('CLI build creates reproducible records with null benchmark scores', async 
     assert.equal(record.evaluation.source, 'not-evaluated');
     assert.equal(record.evaluation.score, null);
     assert.equal(record.task.synthetic, true);
+    // A mock run makes no model call, so it has no usage and no cost to report.
+    assert.equal(record.usage, null);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -99,8 +101,12 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     assert.equal(run.status, 0, run.stderr);
     assert.match(run.stderr, /Reading briefs/);
     assert.match(run.stderr, /one direct-generation call/);
-    assert.match(run.stderr, /OpenAI accepted/);
+    assert.match(run.stderr, /Responses API accepted/);
     assert.match(run.stderr, /Input tokens: 123; output tokens: 456/);
+    // A model absent from the price table still reports tokens, and says so
+    // rather than quoting a fabricated cost.
+    assert.match(run.stderr, /Total usage: 123 input tokens, 456 output tokens/);
+    assert.match(run.stderr, /cost unavailable: no published price for this model/);
     assert.match(run.stderr, /Node talk: conversation; tools: verify_identity; routes: done/);
     assert.equal(run.stderr.includes('DO_NOT_DISPLAY_PRIVATE_REASONING'), false);
     const workflow = JSON.parse(run.stdout);
@@ -121,6 +127,17 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     assert.equal(record.calls[0].request.max_output_tokens, 24000);
     assert.equal(record.config.timeoutMs, 300000);
     assert.equal('headers' in record.calls[0], false);
+    assert.deepEqual(record.usage.tokens, {
+      inputTokens: 123,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 456,
+      reasoningTokens: 0,
+      totalTokens: 579,
+    });
+    assert.equal(record.usage.cost.usd, null);
+    assert.equal(record.usage.cost.source, 'unknown');
+    assert.deepEqual(record.calls[0].usage, record.usage.tokens);
     const events = await readFile(join(traceDirectory, 'trace.jsonl'), 'utf8');
     assert.match(events, /model-call-started/);
     assert.match(events, /model-call-completed/);
@@ -181,6 +198,89 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
   }
 });
 
+test('a priced model records a cost alongside its tokens', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'freya-cost-test-'));
+  const preload = join(directory, 'injected-fetch.mjs');
+  try {
+    await writeFile(
+      preload,
+      `
+      globalThis.fetch = async () => {
+        const blueprint = {
+          initial_node: 'talk',
+          nodes: {
+            talk: { name: 'talk', node_type: 'conversation', tools: ['verify_identity'], transitions: [{ target_node: 'done', description: 'Synthetic test', condition: { operator: 'always' } }] },
+            done: { name: 'done', node_type: 'end_call', transitions: [] },
+          },
+        };
+        const text = JSON.stringify({ workflowJson: JSON.stringify(blueprint), uncertainties: [] });
+        const usage = {input_tokens:1000000, input_tokens_details:{cached_tokens:500000, cache_write_tokens:200000}, output_tokens:1000000, output_tokens_details:{reasoning_tokens:250000}, total_tokens:2000000};
+        const events = [
+          {type:'response.created'},
+          {type:'response.output_text.delta',delta:text},
+          {type:'response.completed',response:{status:'completed',usage,output:[{type:'message',content:[{type:'output_text',text}]}]}},
+        ];
+        return new Response(events.map(event => 'data: '+JSON.stringify(event)+'\\n\\n').join(''), {headers:{'Content-Type':'text/event-stream'}});
+      };
+    `,
+    );
+    const run = spawnSync(
+      process.execPath,
+      ['--import', preload, 'src/cli.ts', 'freya', '--json-only', '--out', directory],
+      {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: 'synthetic-model-key',
+          BUILDER_MODEL: 'gpt-5',
+        },
+      },
+    );
+    assert.equal(run.status, 0, run.stderr);
+    // gpt-5: $1.25/M input, $0.125/M cached, $10/M output. It publishes no
+    // cache-write rate, so writes bill at the standard input rate.
+    // 0.5M uncached (0.3M standard + 0.2M written) + 0.5M cached + 1M output.
+    assert.match(run.stderr, /estimated cost:? \$10\.687500 \(table price\)/i);
+    assert.match(run.stderr, /estimated cost \$10\.687500 at table prices/);
+    assert.match(run.stderr, /Total usage: 1,000,000 input tokens, 1,000,000 output tokens/);
+    assert.match(run.stderr, /250,000 reasoning/);
+    const runsRoot = join(directory, 'generation');
+    const record = JSON.parse(
+      await readFile(join(runsRoot, (await readdir(runsRoot))[0], 'run.json'), 'utf8'),
+    );
+    assert.equal(record.usage.cost.usd, 10.6875);
+    assert.equal(record.usage.cost.source, 'table');
+    assert.equal(record.usage.tokens.reasoningTokens, 250000);
+    assert.equal(record.usage.tokens.cachedInputTokens, 500000);
+    // The written share is split out of the input total, not added to it.
+    assert.equal(record.usage.tokens.cacheWriteTokens, 200000);
+
+    // An env override replaces the table rate and marks the estimate as env-sourced.
+    const overridden = spawnSync(
+      process.execPath,
+      ['--import', preload, 'src/cli.ts', 'freya', '--json-only', '--out', directory],
+      {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: 'synthetic-model-key',
+          BUILDER_MODEL: 'gpt-5',
+          BUILDER_INPUT_PRICE_PER_MTOK: '2',
+          BUILDER_OUTPUT_PRICE_PER_MTOK: '20',
+        },
+      },
+    );
+    assert.equal(overridden.status, 0, overridden.stderr);
+    // An override replaces only the rates it names: 0.5M uncached at $2/M
+    // (writes included) + 0.5M cached still at the table's $0.125/M + 1M at $20/M.
+    assert.match(overridden.stderr, /estimated cost \$21\.062500 at env prices/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('failed generation retains its request and partial draft in the trace with no stdout JSON', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'freya-failed-trace-test-'));
   const preload = join(directory, 'injected-fetch.mjs');
@@ -226,6 +326,67 @@ test('failed generation retains its request and partial draft in the trace with 
       await readFile(join(traceDirectory, 'generation.log'), 'utf8'),
       /synthetic partial draft/,
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('CLI switches to Codex via environment and explicit flags without API or Freya calls', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'builder-codex-cli-test-'));
+  try {
+    const executable = join(directory, 'codex');
+    await writeFile(
+      executable,
+      `#!${process.execPath}
+      (async () => {
+      let input = '';
+      for await (const chunk of process.stdin) input += chunk;
+      if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY || process.env.FREYA_API_KEY) process.exit(2);
+      if (!input.includes('workflowJson')) process.exit(3);
+      if (!process.argv.some(arg => ['model_reasoning_effort="high"', 'model_reasoning_effort="low"'].includes(arg))) process.exit(4);
+      const workflow = { initial_node: 'done', nodes: { done: { name: 'done', node_type: 'end_call', transitions: [] } } };
+      console.log(JSON.stringify({type:'turn.started'}));
+      console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({workflowJson:JSON.stringify(workflow),uncertainties:[]})}}));
+      console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:20}}));
+      })();
+    `,
+    );
+    await chmod(executable, 0o700);
+    for (const args of [[], ['--provider', 'codex', '--reasoning-effort', 'low']]) {
+      const run = spawnSync(
+        process.execPath,
+        ['src/cli.ts', 'freya', '--json-only', '--out', directory, ...args],
+        {
+          cwd: projectRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PATH: directory + ':' + process.env.PATH,
+            BUILDER_PROVIDER: args.length ? 'openai' : 'codex',
+            BUILDER_MODEL: 'synthetic-codex',
+            BUILDER_REASONING_EFFORT: 'high',
+            OPENAI_API_KEY: 'synthetic-api',
+            CODEX_API_KEY: 'synthetic-api',
+            FREYA_API_KEY: 'synthetic-freya',
+          },
+        },
+      );
+      assert.equal(run.status, 0, run.stderr);
+      assert.equal(JSON.parse(run.stdout).initial_node, 'done');
+      assert.match(run.stderr, /Codex started generation/);
+    }
+    const runs = await readdir(join(directory, 'generation'));
+    assert.equal(runs.length, 2);
+    for (const name of runs) {
+      const record = JSON.parse(
+        await readFile(join(directory, 'generation', name, 'run.json'), 'utf8'),
+      );
+      assert.equal(record.config.provider, 'codex');
+      assert.equal(record.calls[0].endpoint, 'codex-exec');
+      assert.ok(['high', 'low'].includes(record.config.reasoningEffort));
+      assert.equal(record.calls[0].request.reasoningEffort, record.config.reasoningEffort);
+      assert.equal(record.evaluation.score, null);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

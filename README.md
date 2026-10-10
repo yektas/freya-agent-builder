@@ -4,13 +4,28 @@ A direct-generation builder for the Build the Builder hackathon. The Freya path 
 
 ## Generate JSON only
 
+Choose either generation provider in `.env` with `BUILDER_PROVIDER=openai` or `BUILDER_PROVIDER=codex`. You can override it for one run:
+
+```sh
+pnpm run generate --provider codex --model YOUR_CODEX_MODEL
+pnpm run generate --provider openai --model YOUR_API_MODEL
+```
+
+Set thinking effort with `BUILDER_REASONING_EFFORT=high` in `.env`, or override it per run with `pnpm run generate --reasoning-effort high`. This works for `build`, `generate`, and `freya` with either live provider. Leave it blank to use the provider default. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` (Codex only); model/client support varies. API effort is sent as [`reasoning.effort`](https://developers.openai.com/api/docs/guides/reasoning), while Codex uses [`model_reasoning_effort`](https://learn.chatgpt.com/docs/config-file/config-reference). Unsupported settings fail without retries or provider fallback. This is separate from `--reasoning-summary` and is recorded in the run configuration and model request.
+
+For direct API generation through codex-lb, set `OPENAI_BASE_URL=http://127.0.0.1:2455/v1` and put a key created on its `/apis` page in `OPENAI_API_KEY`. The inspector uses the API route automatically; use `--provider openai` in the CLI. The request goes to codex-lb’s Responses-compatible endpoint; credentials stay server-side. Leave `OPENAI_BASE_URL` blank to use OpenAI directly. Runs record the base URL without authorization headers.
+
+For Codex, install the Codex CLI and run `codex login`, selecting ChatGPT, then check `codex login status`. This uses your subscription allowance through [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode), with [ChatGPT authentication](https://learn.chatgpt.com/docs/auth). Keep `OPENAI_API_KEY` in `.env` for switching back; the Codex subprocess excludes API and Freya credentials and uses your configured Codex provider and login, including custom providers such as `codex-lb`. Both paths need an explicitly selected model available to that provider. The API path remains the default for `generate` and `freya`; `build` defaults to the offline mock unless a provider is selected.
+
+Codex receives the same original inputs and output schema in an isolated temporary directory, with read-only execution, shell tools, MCP servers, and web search disabled. Your user config supplies the provider and login; the selected model and reasoning effort come from the run. Temporary files are removed afterward. A run permits one CLI invocation under the existing deadline, records provider/model/usage, and accepts only completed JSON. Codex manages its internal inference token limits and retries; the Responses API's output-token cap does not apply to this path. No paid API fallback is attempted. `--show-draft` displays Codex's completed message before local validation; Codex start, reasoning activity (without private text), and completed messages appear in the trace as CLI events arrive. Workflow text arrives when the CLI message completes; `--reasoning-summary` is supported only on the API path. Subscription exhaustion or login/model errors fail the run.
+
 Set `OPENAI_API_KEY` and `BUILDER_MODEL` in `.env`, then run:
 
 ```sh
 pnpm run generate
 ```
 
-This generates a phone-agent **workflow JSON** from Brief A, compiles the tool bindings locally, prints the JSON to the terminal, and saves a local diagnostic trace. It makes one billable OpenAI request. It does not contact Freya, require Freya credentials or Python, or run practice tests. It is locally checked, but has not passed Freya's platform validation or evaluation.
+This generates a phone-agent **workflow JSON** from Brief A, compiles the tool bindings locally, prints the JSON to the terminal, and saves a local diagnostic trace. With the default API provider, it makes one billable OpenAI request; with Codex, it uses subscription allowance. It does not contact Freya, require Freya credentials or Python, or run practice tests. It is locally checked, but has not passed Freya's platform validation or evaluation.
 
 To use another brief, pass `--brief-file`. For B, supply both original briefs:
 
@@ -78,6 +93,19 @@ Choose the builder model through `BUILDER_MODEL` or `--model`. The generated pho
 
 The model produces graph structure, prompts, transitions, optional Python code, and tool **references**. It never generates tool schemas. The compiler translates those references at the verified event boundary using the supplied OpenAPI. Business rules come from the input briefs, not compiler constants. No automatic repair is included yet.
 
+### Token usage and cost
+
+Every run records what it spent. Each provider reports usage in its own shape, so **[src/usage.ts](src/usage.ts)** normalizes both into one record: input, cached input, cache writes, output, and reasoning tokens. Usage is captured before validation runs, so a rejected or truncated response still reports its tokens.
+
+Cost is an **estimate from published per-model rates, not a billed figure**. The rate table is a snapshot transcribed from OpenAI's pricing page on 2026-10-10 and will drift. Points worth knowing:
+
+- Cached reads and cache writes bill at their own rates, which is usually why two runs with the same total tokens cost very different amounts. The newest models report `cache_write_tokens` separately, and for them a first run is mostly a cache _write_.
+- A model with no published rate for a component falls back to the standard input rate, which over-estimates rather than under-estimates.
+- An unknown model reports tokens with no cost, and says so, rather than inventing a figure.
+- Set `BUILDER_INPUT_PRICE_PER_MTOK`, `BUILDER_CACHED_INPUT_PRICE_PER_MTOK`, `BUILDER_CACHE_WRITE_PRICE_PER_MTOK`, or `BUILDER_OUTPUT_PRICE_PER_MTOK` to override individual rates, which also lets you price a model the snapshot has no row for. Any override marks the estimate as `env`-sourced everywhere it appears.
+
+Usage appears in `run.json` as `usage: { tokens, cost }`, in generation progress on stderr, and in the inspector as Tokens and Cost columns plus per-call detail. Runs recorded before this feature still show their tokens — recovered from the provider payload already in each call response — with the cost recomputed and labeled `estimated`.
+
 ## Run the full Freya flow
 
 Requires Node 22.18.0+, pnpm, and Python 3.10+. The event client and scorer use Python's standard library; no Claude SDK is needed for our builder.
@@ -106,7 +134,7 @@ node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \
   --practice-brief B --slot brief-b
 ```
 
-These are live, billable operations. Original brief/tool/platform-documentation inputs are sent to OpenAI. Freya receives the compiled workflow; the official runner creates synthetic bank practice sessions and runs customer/judge simulations on staging. No final competition submission is made.
+These are live operations. API generation is billable; Codex generation uses subscription allowance. Original brief/tool/platform-documentation inputs are sent to OpenAI. Freya receives the compiled workflow; the official runner creates synthetic bank practice sessions and runs customer/judge simulations on staging. No final competition submission is made.
 
 For a smaller smoke test, add `--only PUB-01` to the A command. For different customer speech, add `--style pieces`, `corrects`, `talkative`, `asks_back`, or `in_words`. `--openapi FILE` selects another original tool API file; `--kit DIRECTORY` selects the event package. `--timeout-ms` can lower the total deadline, but cannot exceed 1,800,000 ms. See `node src/cli.ts --help`.
 
@@ -118,9 +146,11 @@ A stable `--slot` updates and **publishes** the same workflow on subsequent runs
 pnpm run ui
 ```
 
-Builds the inspector and opens http://127.0.0.1:4317. `--out DIRECTORY` selects a different record root, `--port` changes the port, and `--kit DIRECTORY` selects the event package used by the upload action. The script loads `.env` and `build-the-builder/env.sh` when they exist, so the upload action finds `FREYA_API_KEY`. Use `pnpm run ui:dev` for Vite hot reload while working on the UI.
+Builds the inspector and opens http://127.0.0.1:4317. `--out DIRECTORY` selects a different record root, `--port` changes the port, and `--kit DIRECTORY` selects the event package used by generation and upload. The script loads `.env` and `build-the-builder/env.sh` when they exist, so the upload action finds `FREYA_API_KEY`. Use `pnpm run ui:dev` for Vite hot reload while working on the UI.
 
-The inspector is **read-only, with one explicitly authorized exception**. It serves a built static bundle plus a small JSON API over recorded files, binds to loopback, rejects every non-GET request, and serves only artifact names found by its own directory scan, so a requested name never reaches the filesystem unchecked. It never starts a run or a generation. The exception is the upload action below, which registers an already compiled workflow on Freya; nothing else writes.
+The inspector binds to loopback and serves only artifact names found by its own directory scan. Recorded runs remain read-only. The two authorized writes are starting a generation and uploading a completed workflow; every other route stays GET-only. Both actions reject cross-origin and non-loopback requests, bound their deadlines, and keep credentials server-side.
+
+**New run** uses the configured Responses API endpoint and lets you choose a listed or custom model and reasoning effort (or the provider default). It generates Brief A from the selected event package with one model call under the recipe deadline, compiles locally, and opens the recorded run. UI generation needs `OPENAI_API_KEY`; `OPENAI_BASE_URL` selects codex-lb or another compatible endpoint. Only one UI generation can run at a time. Registration and practice testing stay separate.
 
 It discovers all three record shapes together and labels each one:
 

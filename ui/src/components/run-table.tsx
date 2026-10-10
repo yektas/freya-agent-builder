@@ -10,12 +10,22 @@ import {
 } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { SidebarTrigger } from '@/components/ui/sidebar';
-import { ago, isRunning, kindLabel, ms, scoreTone, TONE_BG } from '@/lib/data';
-import type { RunSummary } from '@/lib/data';
+import { NewRunAction } from '@/components/new-run-action';
+import { ago, isRunning, kindLabel, ms, scoreTone, tokens, TONE_BG, usd } from '@/lib/data';
+import type { RunSummary, StartedRun } from '@/lib/data';
 import { cn } from '@/lib/utils';
 import { StatusDot } from '@/lib/hooks';
 
-type Key = 'score' | 'status' | 'title' | 'kind' | 'model' | 'elapsed' | 'started';
+type Key =
+  | 'score'
+  | 'status'
+  | 'title'
+  | 'kind'
+  | 'model'
+  | 'tokens'
+  | 'cost'
+  | 'elapsed'
+  | 'started';
 
 const COLUMNS: [Key, string][] = [
   ['score', 'Score'],
@@ -23,6 +33,8 @@ const COLUMNS: [Key, string][] = [
   ['title', 'Run'],
   ['kind', 'Kind'],
   ['model', 'Model'],
+  ['tokens', 'Tokens'],
+  ['cost', 'Cost'],
   ['elapsed', 'Elapsed'],
   ['started', 'Started'],
 ];
@@ -35,9 +47,30 @@ function value(run: RunSummary, key: Key): string | number {
       return Date.parse(run.startedAt ?? '') || 0;
     case 'elapsed':
       return run.elapsedMs ?? 0;
+    // Runs with no priced call sort last rather than first.
+    case 'tokens':
+      return run.usage?.totalTokens ?? -1;
+    case 'cost':
+      return run.usage?.usd ?? -1;
     default:
       return String((run as unknown as Record<string, unknown>)[key] ?? '');
   }
+}
+
+/** Total tokens with the input/output split underneath, when there is a call. */
+function TokenCell({ run }: { run: RunSummary }) {
+  const usage = run.usage;
+  if (!usage || usage.totalTokens === 0) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  return (
+    <div className="font-mono leading-tight">
+      <div className="tabular-nums">{tokens(usage.totalTokens)}</div>
+      <div className="text-[10px] tabular-nums text-muted-foreground">
+        {tokens(usage.inputTokens)} in · {tokens(usage.outputTokens)} out
+      </div>
+    </div>
+  );
 }
 
 function ScoreBar({ run }: { run: RunSummary }) {
@@ -72,10 +105,12 @@ export function RunTable({
   runs,
   selected,
   onSelect,
+  onStarted,
 }: {
   runs: RunSummary[];
   selected: string | null;
   onSelect: (id: string) => void;
+  onStarted: (run: StartedRun) => void;
 }) {
   const [sort, setSort] = React.useState<{ key: Key; dir: -1 | 1 }>({ key: 'started', dir: -1 });
 
@@ -108,7 +143,7 @@ export function RunTable({
       <div className="flex items-center gap-3 border-b border-border px-5 py-3">
         <SidebarTrigger className="-ml-1" />
         <h2 className="text-sm font-semibold">All runs</h2>
-        <p className="text-[11px] text-muted-foreground">
+        <p className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
           {runs.length} recorded · {scored.length} scored
           {mean !== null && (
             <>
@@ -129,6 +164,7 @@ export function RunTable({
             </>
           )}
         </p>
+        <NewRunAction onStarted={onStarted} />
       </div>
       <div className="min-h-0 flex-1 overflow-auto">
         <Table>
@@ -189,6 +225,12 @@ export function RunTable({
                 <TableCell className="text-muted-foreground">{kindLabel(run.kind)}</TableCell>
                 <TableCell className="font-mono text-muted-foreground">
                   {run.model ?? '—'}
+                </TableCell>
+                <TableCell>
+                  <TokenCell run={run} />
+                </TableCell>
+                <TableCell className="font-mono text-muted-foreground">
+                  {run.usage ? usd(run.usage.usd) : '—'}
                 </TableCell>
                 <TableCell className="font-mono text-muted-foreground">
                   {ms(run.elapsedMs)}

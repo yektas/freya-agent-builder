@@ -32,13 +32,17 @@ function inspectorApi(port: number): Plugin {
       loadEventEnv();
       void (async () => {
         const { createUiServer } = await import('../src/ui/server.ts');
+        const kit = join(repo, 'build-the-builder');
+        const experiments = join(repo, 'experiments');
         const api = createUiServer({
-          root: join(repo, 'experiments'),
+          root: experiments,
           port,
           host: '127.0.0.1',
           // Same upload configuration as the served inspector; credentials stay
           // in this process and the browser only receives ids.
-          upload: { root: join(repo, 'experiments'), kit: join(repo, 'build-the-builder') },
+          upload: { root: experiments, kit },
+          // Same generation configuration, so New run works in dev.
+          generation: { root: experiments, kit, openapi: join(kit, 'tools/openapi.json') },
         });
         api.on('error', (error: NodeJS.ErrnoException) => {
           // A stale dev server already owns the port; reuse it rather than

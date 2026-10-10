@@ -221,7 +221,7 @@ export function RunList({
               </>
             ) : (
               // Upload is the one authorized write, from a generation's page.
-              `${runs.length} run${runs.length === 1 ? '' : 's'} · upload only`
+              `${runs.length} run${runs.length === 1 ? '' : 's'}`
             )}
           </p>
         </div>

@@ -53,7 +53,45 @@ test('direct generation keeps original input; source tool schemas are never rege
   assert.equal(bodies[0].max_output_tokens, recipe.limits.maxOutputTokens);
   assert.equal(bodies[0].text.format.strict, true);
   assert.equal(bodies[0].store, false);
+  assert.equal('reasoning' in bodies[0], false);
   assert.equal(JSON.stringify(generator.calls).includes('test-key'), false);
+});
+
+test('a custom Responses base URL preserves the request and keeps credentials out of records', async () => {
+  const generator = new OpenAIGenerator(
+    'synthetic-lb-key',
+    'configured-model',
+    async (url, init) => {
+      assert.equal(url, 'http://127.0.0.1:2455/v1/responses');
+      assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer synthetic-lb-key');
+      const body = JSON.parse(String(init?.body));
+      assert.deepEqual(JSON.parse(body.input).task, task);
+      assert.equal(body.text.format.strict, true);
+      assert.equal(init?.redirect, 'error');
+      return new Response(JSON.stringify(completed(candidate)), {
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+    undefined,
+    'http://127.0.0.1:2455/v1/',
+  );
+  assert.deepEqual(await generator.generate(task, signal()), candidate);
+  assert.equal(generator.calls[0].baseUrl, 'http://127.0.0.1:2455/v1');
+  assert.equal(JSON.stringify(generator.calls).includes('synthetic-lb-key'), false);
+});
+
+test('Responses base URLs refuse credentials and non-HTTP schemes', () => {
+  for (const url of [
+    'file:///tmp/private',
+    'http://user:password@localhost/v1',
+    'http://localhost/v1?key=secret',
+    'not a URL',
+  ]) {
+    assert.throws(
+      () => new OpenAIGenerator('synthetic', 'synthetic', fetch, undefined, url),
+      /OPENAI_BASE_URL/,
+    );
+  }
 });
 
 test('call budget counts failed requests and never transparently retries', async () => {
@@ -211,4 +249,28 @@ test('token-limited streamed responses expose the cause and usage without accept
   });
   await assert.rejects(generator.generate(task, signal()), /budget exhausted/);
   assert.equal(generator.calls.length, 1);
+});
+
+test('explicit API reasoning effort combines with summaries in one request', async () => {
+  for (const reasoningSummary of [false, true]) {
+    const generator = new OpenAIGenerator(
+      'test-key',
+      'configured-model',
+      transport((body) => {
+        assert.deepEqual(
+          body.reasoning,
+          reasoningSummary ? { effort: 'high', summary: 'auto' } : { effort: 'high' },
+        );
+        return completed(candidate);
+      }),
+      {
+        instructions: recipe.instructions,
+        schema: {},
+        ...recipe.limits,
+        reasoningEffort: 'high',
+        reasoningSummary,
+      },
+    );
+    await generator.generate(task, signal());
+  }
 });

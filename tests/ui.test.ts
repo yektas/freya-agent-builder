@@ -225,6 +225,109 @@ test('discovers live runs, generation traces, and build records', async () => {
   ]);
 });
 
+test('surfaces recorded token usage and prices runs that never recorded a cost', async () => {
+  const root = await fixture();
+  // A current run: usage already written to the record, priced at write time.
+  const priced = join(root, 'priced');
+  await mkdir(priced, { recursive: true });
+  await writeFile(
+    join(priced, 'run.json'),
+    JSON.stringify({
+      kind: 'freya-live-run',
+      status: 'completed',
+      startedAt: '2026-10-10T12:00:00.000Z',
+      task: { id: 'brief-a', tools: [] },
+      config: { model: 'gpt-5' },
+      calls: [
+        {
+          endpoint: 'responses',
+          request: {},
+          elapsedMs: 1000,
+          usage: {
+            inputTokens: 1000,
+            cachedInputTokens: 400,
+            outputTokens: 200,
+            reasoningTokens: 50,
+            totalTokens: 1200,
+          },
+        },
+      ],
+      usage: {
+        tokens: {
+          inputTokens: 1000,
+          cachedInputTokens: 400,
+          outputTokens: 200,
+          reasoningTokens: 50,
+          totalTokens: 1200,
+        },
+        // 600 uncached at $1.25/M + 400 cached at $0.125/M + 200 output at $10/M.
+        cost: { usd: 0.0028, source: 'table', inputPerMTok: 1.25 },
+      },
+    }),
+  );
+  // A run recorded before usage tracking: only the provider's own payload remains.
+  const legacy = join(root, 'legacy');
+  await mkdir(legacy, { recursive: true });
+  await writeFile(
+    join(legacy, 'run.json'),
+    JSON.stringify({
+      kind: 'generation-only',
+      status: 'completed',
+      startedAt: '2026-10-09T12:00:00.000Z',
+      task: { id: 'brief-b', tools: [] },
+      config: { model: 'gpt-5' },
+      calls: [
+        {
+          endpoint: 'responses',
+          request: {},
+          elapsedMs: 1000,
+          response: {
+            status: 'completed',
+            usage: { input_tokens: 500, output_tokens: 100, total_tokens: 600 },
+          },
+        },
+      ],
+    }),
+  );
+  // A run with no model call at all.
+  const mock = join(root, 'mock');
+  await mkdir(mock, { recursive: true });
+  await writeFile(
+    join(mock, 'run.json'),
+    JSON.stringify({
+      kind: 'local-build',
+      status: 'built',
+      createdAt: '2026-10-08T12:00:00.000Z',
+      task: { id: 'synthetic', tools: [] },
+      provider: 'mock',
+      calls: [],
+    }),
+  );
+
+  const summaries = await listRuns(root);
+  const pricedRun = summaries.find((run) => run.id === 'priced');
+  assert.equal(pricedRun?.usage?.totalTokens, 1200);
+  assert.equal(pricedRun?.usage?.usd, 0.0028);
+  assert.equal(pricedRun?.usage?.costSource, 'table');
+  assert.equal(pricedRun?.usage?.calls, 1);
+
+  // Tokens recovered from the recorded response; cost derived and labeled as such.
+  const legacyRun = summaries.find((run) => run.id === 'legacy');
+  assert.equal(legacyRun?.usage?.totalTokens, 600);
+  assert.equal(legacyRun?.usage?.costSource, 'estimated');
+  // 500 input at $1.25/M + 100 output at $10/M.
+  assert.ok(Math.abs((legacyRun?.usage?.usd ?? 0) - (500 * 0.00000125 + 100 * 0.00001)) < 1e-12);
+
+  assert.equal(summaries.find((run) => run.id === 'mock')?.usage, null);
+
+  const detail = await loadRun(root, 'priced');
+  assert.equal(detail?.calls[0].usage?.totalTokens, 1200);
+  assert.equal(detail?.calls[0].usd, 0.0028);
+  // An unpriced model still shows tokens per call, with no fabricated cost.
+  const unpriced = summaries.find((run) => run.id === 'mock');
+  assert.equal(unpriced?.usage, null);
+});
+
 test('walks the workflow graph and reports structural observations', async () => {
   const root = await fixture();
   await seedFreyaRun(root);

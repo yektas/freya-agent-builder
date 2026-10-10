@@ -3,12 +3,14 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { build, defaultOptions } from './builder.ts';
 import { LocalAdapter } from './adapter.ts';
-import { parseTask } from './validation.ts';
-import { MockGenerator, OpenAIGenerator } from './providers.ts';
+import { candidateSchema, parseTask } from './validation.ts';
+import { MockGenerator, parseReasoningEffort } from './providers.ts';
+import { createLiveGenerator, liveProvider } from './codex.ts';
 import { hash, saveRun, sourceSnapshot } from './experiments.ts';
 import { recipe } from './recipe.ts';
 import { freyaRecipe } from './recipe.ts';
 import { generateFreyaJson, runFreya } from './event.ts';
+import { estimateCost, hasUsage, sumUsage } from './usage.ts';
 import { startUi } from './ui/server.ts';
 
 const help = `Freya builder
@@ -16,14 +18,14 @@ const help = `Freya builder
 pnpm run generate            print Brief A workflow JSON and save a local trace; no Freya calls
 pnpm run generate --brief-file FILE   use another brief (repeat for additive briefs)
 
-pnpm run ui                  browse recorded runs; read-only, plus the upload action below
+pnpm run ui                  browse recorded runs, start a generation, or upload a finished workflow
 
 node src/cli.ts build --task fixtures/reschedule.json
 node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \\
   --brief-file build-the-builder/briefs/brief-a.md --practice-brief A --slot brief-a
 
 Freya options (live generation, registration, official practice, export):
-  --json-only                 print locally compiled workflow JSON and stop; OpenAI only
+  --json-only                 print locally compiled workflow JSON and stop; openai or codex
   --quiet                     hide generation progress (JSON-only mode)
   --show-draft                stream unvalidated model JSON to stderr (JSON-only mode)
   --reasoning-summary         request model-provided summaries if supported (JSON-only mode)
@@ -37,8 +39,9 @@ Freya options (live generation, registration, official practice, export):
   --timeout-ms 1800000         total Freya run deadline (30 minutes maximum)
 
 Options:
-  --provider mock|openai       mock by default; openai makes billable requests
-  --model MODEL               or BUILDER_MODEL; required for openai
+  --provider mock|openai|codex or BUILDER_PROVIDER; build defaults to mock, freya to openai
+  --model MODEL               or BUILDER_MODEL; required for openai or codex
+  --reasoning-effort LEVEL     or BUILDER_REASONING_EFFORT; unset uses provider default
   --timeout-ms ${recipe.limits.timeoutMs}         total build deadline, up to 1800000 ms
   --out experiments           append-only run records with source snapshots
 
@@ -67,8 +70,9 @@ async function main() {
       help: { type: 'boolean' },
       task: { type: 'string' },
       out: { type: 'string', default: 'experiments' },
-      provider: { type: 'string', default: 'mock' },
+      provider: { type: 'string' },
       model: { type: 'string' },
+      'reasoning-effort': { type: 'string' },
       'timeout-ms': { type: 'string', default: String(defaultOptions.timeoutMs) },
       'brief-file': { type: 'string', multiple: true },
       openapi: { type: 'string' },
@@ -97,23 +101,35 @@ async function main() {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error('ui port must be an integer from 1 to 65535.');
     }
-    // The inspector only reads recorded files. Upload is the one authorized
-    // write, so the credentials stay in this process and the action asks for a
-    // discovered run id, never for a path or a key.
+    // The inspector only reads recorded files, except for the two authorized
+    // actions. Upload registers an already compiled workflow on Freya and
+    // generation starts one new local run; both ask for discovered ids or
+    // plain choices, never for a path or a key, and credentials stay here.
     startUi({
       root: resolve(values.out!),
       port,
       host: values.host!,
       upload: { root: resolve(values.out!), kit: resolve(values.kit!) },
+      generation: {
+        root: resolve(values.out!),
+        kit: resolve(values.kit!),
+        openapi: resolve(values.openapi || resolve(values.kit!, 'tools/openapi.json')),
+      },
     });
     return;
   }
+  const reasoningEffort = parseReasoningEffort(
+    values['reasoning-effort'] ?? process.env.BUILDER_REASONING_EFFORT,
+  );
   if (positionals[0] === 'freya') {
+    const provider = liveProvider(values.provider || process.env.BUILDER_PROVIDER || 'openai');
     if (values['json-only']) {
       const workflow = await generateFreyaJson({
         briefs: values['brief-file'] || [resolve(values.kit!, 'briefs/brief-a.md')],
         openapi: values.openapi || resolve(values.kit!, 'tools/openapi.json'),
         kit: values.kit!,
+        provider,
+        reasoningEffort,
         model: values.model || process.env.BUILDER_MODEL || '',
         timeoutMs: Number(
           process.argv.includes('--timeout-ms') ||
@@ -148,6 +164,8 @@ async function main() {
           ? values['timeout-ms']
           : freyaRecipe.limits.timeoutMs,
       ),
+      provider,
+      reasoningEffort,
       model: values.model || process.env.BUILDER_MODEL || '',
     });
     console.log(JSON.stringify(result));
@@ -162,13 +180,17 @@ async function main() {
   if (!values.task) {
     throw new Error('build requires --task FILE.');
   }
-  if (!['mock', 'openai'].includes(values.provider!)) {
-    throw new Error('provider must be mock or openai.');
-  }
-  const model = values.model || process.env.BUILDER_MODEL;
-  if (values.provider === 'openai' && (!model?.trim() || !process.env.OPENAI_API_KEY?.trim())) {
-    throw new Error('Live runs require OPENAI_API_KEY and --model or BUILDER_MODEL.');
-  }
+  const provider = values.provider || process.env.BUILDER_PROVIDER || 'mock';
+  const model = values.model || process.env.BUILDER_MODEL || '';
+  const generator =
+    provider === 'mock'
+      ? new MockGenerator()
+      : createLiveGenerator(liveProvider(provider), model, {
+          instructions: recipe.instructions,
+          schema: candidateSchema,
+          ...recipe.limits,
+          reasoningEffort,
+        });
   const timeoutMs = Number(values['timeout-ms']);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 1800000) {
     throw new Error('timeout-ms must be an integer from 1 to 1800000.');
@@ -176,25 +198,27 @@ async function main() {
   const options = { timeoutMs };
   const task = parseTask(JSON.parse(await readFile(resolve(values.task), 'utf8')));
   const source = await sourceSnapshot();
-  const generator =
-    values.provider === 'openai'
-      ? new OpenAIGenerator(process.env.OPENAI_API_KEY!, model!)
-      : new MockGenerator();
   const started = performance.now();
   const result = await build(task, generator, new LocalAdapter(), options);
+  const calls = 'calls' in generator ? generator.calls : [];
+  const runModel = 'model' in generator ? generator.model : null;
+  const tokens = sumUsage(calls.map((call) => call.usage));
+  const usage = hasUsage(tokens) ? { tokens, cost: estimateCost(tokens, runModel) } : null;
   const path = await saveRun(resolve(values.out!), {
     task,
     inputHash: hash(task),
     candidateHash: result.candidate ? hash(result.candidate) : null,
     source,
     nodeVersion: process.version,
-    provider: values.provider!,
-    model: generator instanceof OpenAIGenerator ? generator.model : null,
+    provider,
+    model: runModel,
+    reasoningEffort: reasoningEffort ?? null,
     maxCalls: recipe.limits.maxCalls,
     options,
     elapsedMs: Math.round(performance.now() - started),
     build: result,
-    calls: generator instanceof OpenAIGenerator ? generator.calls : [],
+    calls,
+    usage,
     evaluation: {
       score: null,
       source: 'not-evaluated',
@@ -202,7 +226,7 @@ async function main() {
     },
   });
   console.log(
-    JSON.stringify({ taskId: task.id, status: result.status, path, error: result.error }),
+    JSON.stringify({ taskId: task.id, status: result.status, path, error: result.error, usage }),
   );
   if (result.status === 'failed') {
     process.exitCode = 1;

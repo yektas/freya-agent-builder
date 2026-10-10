@@ -4,7 +4,8 @@ import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { BuildOptions, BuildResult, Task } from './contracts.ts';
-import type { CallRecord } from './providers.ts';
+import type { CallRecord, ReasoningEffort } from './providers.ts';
+import type { CostEstimate, TokenUsage } from './usage.ts';
 
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 export const hash = (value: unknown) =>
@@ -59,11 +60,14 @@ export type RunRecord = {
   nodeVersion: string;
   provider: string;
   model: string | null;
+  reasoningEffort: ReasoningEffort | null;
   maxCalls: number;
   options: BuildOptions;
   elapsedMs: number;
   build: BuildResult;
   calls: CallRecord[];
+  // Null for mock runs and for live runs that never reached a model call.
+  usage: { tokens: TokenUsage; cost: CostEstimate } | null;
   evaluation: { score: null; source: 'not-evaluated'; details: string };
 };
 

@@ -5,6 +5,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { object } from '../validation.ts';
 import { projectRoot } from '../experiments.ts';
+import { estimateCost, hasUsage, normalizeUsage, sumUsage } from '../usage.ts';
 
 export type RunKind = 'freya-live-run' | 'generation-only' | 'local-build';
 
@@ -16,6 +17,26 @@ export type EvaluationView = {
   total: number | null;
   source: string;
   details: string | null;
+};
+
+// Token counts plus a cost estimate. `usd` is null when the run predates cost
+// tracking, made no model call, or names a model this snapshot has no price for.
+export type UsageView = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  calls: number;
+  usd: number | null;
+  costSource: string;
+};
+
+export type TokenUsageView = {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
 };
 
 export type RunSummary = {
@@ -31,6 +52,7 @@ export type RunSummary = {
   taskId: string | null;
   synthetic: boolean;
   evaluation: EvaluationView;
+  usage: UsageView | null;
   error: string | null;
   counts: {
     nodes: number | null;
@@ -116,6 +138,8 @@ export type CallView = {
   error: string | null;
   hasRequest: boolean;
   hasResponse: boolean;
+  usage: TokenUsageView | null;
+  usd: number | null;
 };
 
 export type CandidateView = {
@@ -551,6 +575,42 @@ function evaluationView(raw: unknown, fallback: Partial<EvaluationView>): Evalua
   };
 }
 
+// Runs recorded before usage tracking still carry the provider's own payload in
+// each call response, so tokens can be recovered; only the cost cannot, because
+// pricing is applied at write time.
+function usageView(run: Record<string, unknown>, model: string | null): UsageView | null {
+  const recorded = record(run.usage);
+  let calls = 0;
+  const tokens = sumUsage(
+    list(run.calls).map((item) => {
+      const call = record(item);
+      calls++;
+      return (
+        normalizeUsage(call.usage) ??
+        normalizeUsage(record(call.response).usage) ??
+        normalizeUsage(record(record(call.response).response).usage)
+      );
+    }),
+  );
+  if (!hasUsage(tokens) && !object(recorded.tokens)) {
+    return null;
+  }
+  const stored = hasUsage(normalizeUsage(recorded.tokens))
+    ? normalizeUsage(recorded.tokens)!
+    : tokens;
+  const cost = record(recorded.cost);
+  const usd = whole(cost.usd);
+  // A record written before cost tracking still gets an estimate, priced with
+  // today's table and labeled so the number is not mistaken for a billed one.
+  const estimate = usd !== null ? usd : estimateCost(stored, model).usd;
+  return {
+    ...stored,
+    calls,
+    usd: estimate,
+    costSource: usd !== null ? (text(cost.source) ?? 'recorded') : 'estimated',
+  };
+}
+
 function summarize(
   id: string,
   kind: RunKind,
@@ -581,6 +641,7 @@ function summarize(
         : text(build.error);
   const title =
     text(config.slot) ?? text(task.id) ?? text(record(run.runId)) ?? text(run.runId) ?? id;
+  const model = text(config.model) ?? text(run.model);
   const summary: RunSummary = {
     id,
     kind,
@@ -588,12 +649,13 @@ function summarize(
     status: String(run.status ?? build.status ?? 'unknown'),
     startedAt: text(run.startedAt) ?? text(run.createdAt),
     elapsedMs: whole(run.elapsedMs),
-    model: text(config.model) ?? text(run.model),
+    model,
     provider: text(run.provider),
     slot: text(config.slot),
     taskId: text(task.id),
     synthetic: task.synthetic === true,
     evaluation,
+    usage: usageView(run, model),
     error,
     counts: {
       nodes: nodeCount,
@@ -749,12 +811,25 @@ export async function loadRun(root: string, id: string): Promise<RunDetail | nul
   const practiceFile = await readJson(join(run.runPath, 'practice.json'));
   const calls = list(parsed.calls).map((item) => {
     const call = record(item);
+    const tokens =
+      normalizeUsage(call.usage) ??
+      normalizeUsage(record(call.response).usage) ??
+      normalizeUsage(record(record(call.response).response).usage);
     return {
       endpoint: String(call.endpoint ?? 'unknown'),
       elapsedMs: whole(call.elapsedMs),
       error: text(call.error),
       hasRequest: call.request !== undefined,
       hasResponse: call.response !== undefined,
+      usage: tokens
+        ? {
+            inputTokens: tokens.inputTokens,
+            outputTokens: tokens.outputTokens,
+            reasoningTokens: tokens.reasoningTokens,
+            totalTokens: tokens.totalTokens,
+          }
+        : null,
+      usd: tokens ? estimateCost(tokens, summary.model).usd : null,
     };
   });
   const rawCandidate = parsed.rawCandidate;
