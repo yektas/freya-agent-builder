@@ -333,29 +333,35 @@ function parseBlueprint(source: string): unknown {
   // A model can produce a valid outer response but omit the backslashes around
   // a quoted literal inside workflowJson (observed in a generated Python code
   // string). Repair only a quote that JSON.parse has just treated as the end of
-  // a value and that is immediately followed by non-JSON content. Do not infer
+  // a value and that is followed by non-JSON content, allowing whitespace. Do not infer
   // missing fields or delimiters. The normal compiler checks still run after it.
   let candidate = relaxInvalidEscapes(source);
-  for (let repairs = 0; repairs <= 16; repairs += 1) {
+  for (let repairs = 0; repairs <= 64; repairs += 1) {
     try {
       return JSON.parse(candidate);
     } catch (error) {
-      if (!(error instanceof SyntaxError) || repairs === 16) {
+      if (!(error instanceof SyntaxError) || repairs === 64) {
         throw error;
       }
       const position = /after (?:property value|array element) in JSON at position (\d+)/.exec(
         error.message,
       )?.[1];
       const at = position === undefined ? -1 : Number(position);
+      // JSON.parse reports the next non-whitespace character, which can be a
+      // Python keyword following the unescaped quote (for example, `" for`).
+      let quoteEnd = at;
+      while (quoteEnd > 0 && /\s/.test(candidate[quoteEnd - 1]!)) {
+        quoteEnd -= 1;
+      }
       if (
         at < 1 ||
-        candidate[at - 1] !== '"' ||
+        candidate[quoteEnd - 1] !== '"' ||
         !candidate[at] ||
         /[\s,}\]:"]/.test(candidate[at])
       ) {
         throw error;
       }
-      candidate = `${candidate.slice(0, at - 1)}\\${candidate.slice(at - 1)}`;
+      candidate = `${candidate.slice(0, quoteEnd - 1)}\\${candidate.slice(quoteEnd - 1)}`;
     }
   }
   throw new Error('Unreachable blueprint parser state.');

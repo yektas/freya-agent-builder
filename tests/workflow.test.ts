@@ -77,6 +77,17 @@ test('compiler recovers unescaped inner quotes in a generated string without cha
   );
 });
 
+test('compiler recovers many quoted literals including a quote followed by whitespace', () => {
+  const authored = {
+    ...blueprint(),
+    system_prompt: Array.from({ length: 10 }, () => `return "'dir." for item`).join(' '),
+  };
+  const broken = JSON.stringify(authored).replaceAll('\\"', '"');
+  assert.throws(() => JSON.parse(broken));
+  const compiled = compileWorkflow(task, { workflowJson: broken, uncertainties: [] }) as any;
+  assert.equal(compiled.system_prompt, authored.system_prompt);
+});
+
 test('compiler accepts the documented code_exec wrapper as a code action', () => {
   const authored: any = blueprint();
   authored.nodes.talk.node_type = 'code';
