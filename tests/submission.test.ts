@@ -55,9 +55,17 @@ test('single-case submission matches the selected export, trace, and committed b
       startedAt: '2026-10-11T17:00:00Z',
       endedAt: '2026-10-11T17:01:00Z',
       elapsedMs: 60000,
-      calls: [],
+      calls: [
+        {
+          request: {
+            prompt: 'Example Authorization: Bearer token',
+            attachment: 'x'.repeat(1_100_000),
+          },
+        },
+      ],
       modelCallPurpose: 'Synthetic fixture',
       task: {
+        description: 'Example Authorization: Bearer token',
         tools: [{ name: 'synthetic_tool', url: 'https://original.example.invalid/synthetic_tool' }],
       },
       inputHash: 'input',
@@ -109,6 +117,13 @@ test('single-case submission matches the selected export, trace, and committed b
     assert.equal(pending.workflow, 'submission/final.workflow.json');
     assert.equal(pending.trace, 'submission/final.trace.json');
     assert.equal(pending.mock_url, options.mockUrl);
+    const trace = JSON.parse(await readFile(join(root, pending.trace), 'utf8'));
+    assert.equal(trace.inputs.description, 'Example Authorization: Bearer [REDACTED]');
+    assert.equal(
+      trace.modelCalls[0].call.request.prompt,
+      'Example Authorization: Bearer [REDACTED]',
+    );
+    assert.equal(run.task.description, 'Example Authorization: Bearer token');
     await assert.rejects(() => finalizeSubmission('submission', commit, root));
     git('add', 'submission/final.workflow.json', 'submission/final.trace.json');
     git('commit', '-m', 'Synthetic selected artifacts');

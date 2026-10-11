@@ -6,7 +6,9 @@
     "coverage/**",
     "ui/dist/**",
     "pnpm-lock.yaml",
-    "build-the-builder/**"
+    "build-the-builder/**",
+    "submission/final.workflow.json",
+    "submission/final.trace.json"
   ],
   "singleQuote": true,
   "printWidth": 100,

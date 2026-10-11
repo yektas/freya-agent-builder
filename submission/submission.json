@@ -1,0 +1,15 @@
+{
+  "team": "yektas",
+  "members": [
+    {
+      "name": "Sercan Yektas",
+      "email": "ahmetsercanyektas@gmail.com"
+    }
+  ],
+  "repo": "https://github.com/yektas/freya-agent-builder.git",
+  "commit": "d8affa1cbd57d6c84919f3a19ca6c7171fd1c3c0",
+  "run_command": "scripts/run-final-case.sh {case_folder} {mock_url}",
+  "workflow": "submission/final.workflow.json",
+  "trace": "submission/final.trace.json",
+  "mock_url": "https://freyabank-statement-mock.yektas.workers.dev"
+}

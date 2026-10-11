@@ -8,6 +8,21 @@ import { parseFreyaStrategy } from './strategies.ts';
 
 type Member = { name: string; email: string };
 
+function redactAuthExamples(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\b(Bearer|Basic)\s+(?!\[REDACTED\])\S+/gi, '$1 [REDACTED]');
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactAuthExamples);
+  }
+  if (object(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, redactAuthExamples(item)]),
+    );
+  }
+  return value;
+}
+
 function rejectSecrets(value: unknown) {
   const secrets = ['OPENAI_API_KEY', 'FREYA_API_KEY', 'FREYA_BANK_TEAM_KEY']
     .map((name) => process.env[name])
@@ -118,6 +133,7 @@ export async function prepareSubmission(
       cwd: repository,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: 16 * 1024 * 1024,
     });
   if (!/^[a-f0-9]{7,40}$/i.test(options.commit)) {
     throw new Error('Use a Git commit SHA.');
@@ -194,11 +210,11 @@ export async function prepareSubmission(
       inputHash: run.inputHash,
       sourceHash: run.source.hash,
       commit,
-      inputs: run.task,
+      inputs: redactAuthExamples(run.task),
       modelCalls: run.calls.map((call: unknown) => ({
         model: run.config.model,
         purpose: run.modelCallPurpose,
-        call,
+        call: redactAuthExamples(call),
       })),
       registration: run.registration,
       nodes:
@@ -267,6 +283,7 @@ export async function finalizeSubmission(out: string, commitRef: string, reposit
       cwd: repository,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: 16 * 1024 * 1024,
     });
   const commit = git('rev-parse', `${commitRef}^{commit}`).trim();
   const path = resolve(repository, out, 'submission.json');
