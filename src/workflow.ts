@@ -204,6 +204,10 @@ function bindTool(
       schema.default ??
       (name === 'customer_id' ? '{{customer_id}}' : `{{arg_${tool.name}_${name}}}`);
   }
+  if (typeof tool.url !== 'string') {
+    throw new Error(`Missing source URL for ${tool.name}.`);
+  }
+  const sourceUrl = mockBase ? new URL(tool.url) : null;
   const result: JsonObject = {
     type: 'function',
     config: {
@@ -218,7 +222,10 @@ function bindTool(
       parameters: {
         type: 'object',
         properties: {
-          url: { type: 'string', default: mockBase ? mockBase + tool.path : tool.url },
+          url: {
+            type: 'string',
+            default: sourceUrl ? mockBase + sourceUrl.pathname + sourceUrl.search : tool.url,
+          },
           method: { type: 'string', default: tool.method },
           headers: {
             type: 'object',

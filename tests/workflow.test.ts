@@ -225,13 +225,26 @@ test('final mock URL is applied only at the compiler boundary', () => {
   }) as any;
   assert.equal(
     workflow.nodes.talk.tools[0].function.parameters.properties.url.default,
-    'https://synthetic-bank.workers.dev/verify_identity',
+    'https://synthetic-bank.workers.dev/v1/verify_identity',
   );
   assert.deepEqual(task, before);
   assert.throws(
     () => compileWorkflow(task, candidate(blueprint()), { mockUrl: 'http://unsafe.invalid' }),
     /Mock URL must be an HTTPS/,
   );
+});
+
+test('mock binding preserves the source server path before the operation path', () => {
+  const bank = structuredClone(task);
+  bank.tools[0]!.url = 'https://source-bank.invalid/voice/v1/verify_identity';
+  const workflow = compileWorkflow(bank, candidate(blueprint()), {
+    mockUrl: 'https://synthetic-bank.workers.dev',
+  }) as any;
+  assert.equal(
+    workflow.nodes.talk.tools[0].function.parameters.properties.url.default,
+    'https://synthetic-bank.workers.dev/voice/v1/verify_identity',
+  );
+  assert.equal(bank.tools[0]!.url, 'https://source-bank.invalid/voice/v1/verify_identity');
 });
 
 test('nested request envelopes are reconstructed at the verified API boundary', () => {
