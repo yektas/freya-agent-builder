@@ -50,11 +50,31 @@ test('an invalid escape does not cost a paid generation, and valid JSON is untou
   const rich = JSON.stringify({ s: 'a\nb\tc\\d"eé/f' });
   assert.equal(relaxInvalidEscapes(rich), rich);
   assert.equal(JSON.parse(relaxInvalidEscapes(rich)).s, 'a\nb\tc\\d"eé/f');
+  assert.equal(JSON.parse(relaxInvalidEscapes(String.raw`{"s":"\d"}`)).s, String.raw`\d`);
   // A truncated \u escape is relaxed too, and a trailing backslash is left alone.
   assert.equal(relaxInvalidEscapes('"\\u12"'), '"u12"');
   assert.equal(relaxInvalidEscapes('"abc\\'), '"abc\\');
   // Genuinely broken JSON still fails rather than being silently invented.
   assert.throws(() => compileWorkflow(task, { workflowJson: '{oops', uncertainties: [] }));
+});
+
+test('compiler preserves regex escapes in generated Python date code', () => {
+  const authored: any = blueprint();
+  authored.nodes.talk.node_type = 'code';
+  delete authored.nodes.talk.tools;
+  authored.nodes.talk.pre_actions = [
+    {
+      code: String.raw`import re
+vars['date_match'] = bool(re.search(r'\b\d{4}-\d{2}-\d{2}\b', '2026-10-14'))`,
+    },
+  ];
+  const broken = JSON.stringify(authored)
+    .replaceAll(String.raw`\\b`, String.raw`\b`)
+    .replaceAll(String.raw`\\d`, String.raw`\d`);
+  assert.throws(() => JSON.parse(broken));
+  const compiled = compileWorkflow(task, { workflowJson: broken, uncertainties: [] }) as any;
+  const code = compiled.nodes.talk.pre_actions[0].function.parameters.properties.code.default;
+  assert.equal(code, authored.nodes.talk.pre_actions[0].code);
 });
 
 test('compiler recovers unescaped inner quotes in a generated string without changing its content', () => {
@@ -216,6 +236,27 @@ test('compiler binds original OpenAPI schemas without changing sources or accept
   assert.throws(() => compileWorkflow(task, candidate(invalid)), /schemas/);
   invalid.nodes.talk.tools = ['invented_tool'];
   assert.throws(() => compileWorkflow(task, candidate(invalid)), /Unknown bank tool/);
+});
+
+test('an omitted optional bank-tool field has no generated body default', () => {
+  const authored: any = blueprint();
+  authored.nodes.talk.node_type = 'api_request';
+  delete authored.nodes.talk.tools;
+  authored.nodes.talk.pre_actions = [{ name: 'close_call', bodyDefaults: { outcome: 'promise' } }];
+  const compiled = compileWorkflow(task, candidate(authored)) as any;
+  const body = compiled.nodes.talk.pre_actions[0].function.parameters.properties.body;
+  assert.equal(body.properties.outcome.default, 'promise');
+  assert.equal(body.properties.customer_id.default, '{{customer_id}}');
+  assert.equal('default' in body.properties.reason, false);
+  assert.equal(body.required.includes('reason'), false);
+
+  authored.nodes.talk.pre_actions[0].bodyDefaults.reason = 'callback';
+  const withReason = compileWorkflow(task, candidate(authored)) as any;
+  assert.equal(
+    withReason.nodes.talk.pre_actions[0].function.parameters.properties.body.properties.reason
+      .default,
+    'callback',
+  );
 });
 
 test('final mock URL is applied only at the compiler boundary', () => {

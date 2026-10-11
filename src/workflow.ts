@@ -198,11 +198,15 @@ function bindTool(
   if (!object(defaults) || Object.keys(defaults).some((name) => !(name in properties))) {
     throw new Error(`Unknown body default for ${tool.name}`);
   }
+  const required = new Set(Array.isArray(body.required) ? body.required : []);
   for (const [name, schema] of Object.entries(properties)) {
-    schema.default =
-      defaults[name] ??
-      schema.default ??
-      (name === 'customer_id' ? '{{customer_id}}' : `{{arg_${tool.name}_${name}}}`);
+    if (defaults[name] !== undefined) {
+      schema.default = defaults[name];
+    } else if (schema.default === undefined && name === 'customer_id') {
+      schema.default = '{{customer_id}}';
+    } else if (schema.default === undefined && required.has(name)) {
+      schema.default = `{{arg_${tool.name}_${name}}}`;
+    }
   }
   if (typeof tool.url !== 'string') {
     throw new Error(`Missing source URL for ${tool.name}.`);
@@ -301,12 +305,14 @@ except Exception:
 }
 
 /**
- * Drop backslashes that begin an escape JSON does not define.
+ * Recover backslashes that begin an escape JSON does not define.
  *
  * A model asked to embed JSON inside a JSON string sometimes writes `\'` because it is
  * reasoning about a nested quoted literal. That single character makes the whole
- * document unparseable and loses an entire paid generation. Every defined escape is left
- * byte-for-byte alone, so a document that already parses is returned unchanged.
+ * document unparseable and loses an entire paid generation. Python code can also
+ * contain regex escapes such as `\d`; dropping that slash silently changes its
+ * meaning. Preserve unknown escapes as literal backslashes, except the observed
+ * escaped apostrophe and incomplete Unicode escape. Valid JSON is untouched.
  */
 export function relaxInvalidEscapes(source: string): string {
   let out = '';
@@ -330,7 +336,7 @@ export function relaxInvalidEscapes(source: string): string {
       i += 1;
       continue;
     }
-    out += next;
+    out += next === "'" || next === 'u' ? next : '\\' + '\\' + next;
     i += 1;
   }
   return out;
@@ -379,7 +385,7 @@ function codeSource(action: unknown): string | null {
     return null;
   }
   if (typeof action.code === 'string' && Object.keys(action).length === 1) {
-    return action.code;
+    return action.code.replaceAll('\b', '\\b');
   }
   if (
     Object.keys(action).some((field) => !['type', 'function'].includes(field)) ||
@@ -409,7 +415,9 @@ function codeSource(action: unknown): string | null {
   ) {
     return null;
   }
-  return action.function.parameters.properties.code.default;
+  // JSON accepts `\b` and decodes it to backspace, but a generated Python raw
+  // regex often means a word boundary. Backspace cannot execute as Python source.
+  return action.function.parameters.properties.code.default.replaceAll('\b', '\\b');
 }
 
 export function compileWorkflow(
