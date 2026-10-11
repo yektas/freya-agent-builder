@@ -19,7 +19,7 @@ export type Usage = {
   totalTokens: number;
   calls: number;
   usd: number | null;
-  /** `recorded`, `estimated`, or the price source the record was written with. */
+  /** The price source recorded with the run's cost estimate. */
   costSource: string;
 };
 
@@ -31,8 +31,8 @@ export type CallUsage = {
 };
 
 /**
- * The artifact a reviewer most often wants: the compiled workflow JSON. Runs that
- * predate the standalone artifact still carry it inside run.json.
+ * The workflow artifact a reviewer most often wants, preferring the compiled
+ * blueprint over the platform's exported copy.
  */
 export function defaultFile(files: RunFile[]): string | null {
   const byName = (name: string) => files.find((file) => file.name === name);
@@ -56,6 +56,9 @@ export type RunSummary = {
   slot: string | null;
   taskId: string | null;
   synthetic: boolean;
+  /** True when the run sits in the archive folder, out of the main list. */
+  archived: boolean;
+  practiceStatus?: 'running' | 'completed' | 'failed' | null;
   evaluation: Evaluation;
   usage: Usage | null;
   error: string | null;
@@ -89,7 +92,6 @@ export type GraphNode = {
 };
 
 export type Workflow = {
-  source: 'compiled' | 'exported' | 'recorded';
   initialNode: string | null;
   systemPrompt: string | null;
   contextVariables: string[];
@@ -174,37 +176,43 @@ export type Upload = {
   error: string | null;
 };
 
-export type Provider = 'openai' | 'codex';
-
 /** What the New run dialog may choose. Mirrors `GET /api/generate`. */
 export type GenerationAvailability = {
   available: boolean;
   problem: string | null;
-  /** Per-provider readiness; one unusable path does not disable the other. */
-  providers: { id: Provider; available: boolean; problem: string | null }[];
-  models: Record<Provider, string[]>;
+  models: string[];
   reasoningEfforts: ReasoningEffort[];
   timeoutMs: number;
   /** The generation already in flight, if any. */
-  running: { runId: string; provider: Provider; model: string } | null;
+  running: { runId: string; model: string } | null;
 };
 
-export type ReasoningEffort =
-  | 'none'
-  | 'minimal'
-  | 'low'
-  | 'medium'
-  | 'high'
-  | 'xhigh'
-  | 'max'
-  | 'ultra';
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /** The run a New run request started, from `POST /api/generate`. */
 export type StartedRun = {
   runId: string;
-  provider: Provider;
   model: string;
   reasoningEffort?: ReasoningEffort;
+};
+
+export type PracticeJob = {
+  id: string;
+  status: 'running' | 'completed' | 'failed';
+  stage: string;
+  brief: 'A' | 'B' | 'all';
+  style: string | null;
+  repetitions: number;
+  agentId: string;
+  workflowId: string;
+  workspaceId: string;
+  workflowHash: string;
+  startedAt: string;
+  endedAt: string | null;
+  elapsedMs: number | null;
+  error: string | null;
+  passed: number | null;
+  total: number | null;
 };
 
 export type RunDetail = {
@@ -214,6 +222,7 @@ export type RunDetail = {
   /** The workflow document exactly as recorded, for copying into a submission. */
   workflowJson: string | null;
   practice: Practice | null;
+  practiceJob: PracticeJob | null;
   calls: Call[];
   trace: TraceEntry[];
   candidate: Candidate | null;
@@ -232,7 +241,8 @@ const KIND: Record<string, string> = {
 };
 
 export const kindLabel = (kind: string) => KIND[kind] ?? kind;
-export const isRunning = (run: { status: string }) => run.status === 'running';
+export const isRunning = (run: { status: string; practiceStatus?: string | null }) =>
+  run.status === 'running' || run.practiceStatus === 'running';
 
 export function when(iso: string | null) {
   if (!iso) return '—';

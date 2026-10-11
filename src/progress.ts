@@ -5,7 +5,6 @@ import { estimateCost, normalizeUsage } from './usage.ts';
 
 export function generationProgress(
   options: {
-    provider?: string;
     quiet?: boolean;
     showDraft?: boolean;
     reasoningSummary?: boolean;
@@ -65,9 +64,7 @@ export function generationProgress(
       heartbeat = setInterval(
         () =>
           report(
-            options.provider === 'codex'
-              ? 'Waiting for Codex completion; the CLI returns workflow text when its message completes.'
-              : `Waiting for model completion; ${outputChars.toLocaleString('en-US')} draft characters received.`,
+            `Waiting for model completion; ${outputChars.toLocaleString('en-US')} draft characters received.`,
           ),
         10000,
       );
@@ -75,15 +72,8 @@ export function generationProgress(
     },
     model(event: ModelEvent) {
       switch (event.kind) {
-        case 'status':
-          report(event.reason ?? 'Codex reported activity.');
-          break;
         case 'accepted':
-          report(
-            options.provider === 'codex'
-              ? 'Codex started generation.'
-              : 'Responses API accepted the request.',
-          );
+          report('Responses API accepted the request.');
           break;
         case 'reasoning':
           report('Model is reasoning; private internal text is not exposed.');

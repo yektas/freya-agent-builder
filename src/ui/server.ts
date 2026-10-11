@@ -1,27 +1,42 @@
-// Local HTTP server for the run inspector. Recorded files stay read-only; the
-// authorized actions start a local generation or upload a compiled workflow to
-// Freya. It binds to loopback and keeps credentials in the server process.
+// Local HTTP server for the run inspector. Recorded files otherwise stay
+// read-only; the authorized actions archive or delete a recorded run, start a
+// local generation, or upload a compiled workflow to Freya. It binds to
+// loopback and keeps credentials in the server process.
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { listRuns, loadRun, readRunFile } from './records.ts';
-import { UploadError, uploadAvailability, uploadRun } from './upload.ts';
+import { archiveRun, deleteRun, listRuns, loadRun, readRunFile, restoreRun } from './records.ts';
+import { UploadError, uploadAvailability, uploadRun, workflowConsole } from './upload.ts';
 import type { UploadOptions } from './upload.ts';
 import { GenerateError, generationAvailability, startGeneration } from './generate.ts';
 import type { GenerationOptions } from './generate.ts';
+import { PracticeError, practiceAvailability, startPractice } from './practice.ts';
+import type { PracticeOptions } from './practice.ts';
 
 export type UiOptions = {
   root: string;
   port: number;
   host: string;
   /**
+   * Delete configuration. Omitted means the inspector cannot delete a run,
+   * which is the safe default for a read-only browsing session.
+   */
+  allowDelete?: boolean;
+  /**
+   * Archive configuration. Omitted means the inspector can only browse, which
+   * is the safe default for a read-only session; archiving moves a run aside
+   * for restore instead of deleting, so it is the gentler sibling of delete.
+   */
+  allowArchive?: boolean;
+  /**
    * Upload configuration. Omitted means the inspector cannot register anything,
    * which is the safe default for a read-only browsing session.
    */
   upload?: UploadOptions | null;
+  practice?: PracticeOptions | null;
   /**
    * Generation configuration. Omitted means the inspector cannot start a run,
    * which is the safe default for a read-only browsing session.
@@ -94,23 +109,48 @@ async function route(options: UiOptions, url: URL, response: ServerResponse) {
   const root = resolve(options.root);
   const path = safePath(url);
   if (path === '/api/runs') {
-    sendJson(response, 200, { runs: await listRuns(root) });
+    // Main list by default; ?archived=1 shows only archived runs.
+    const all = await listRuns(root);
+    const archivedOnly = url.searchParams.get('archived') === '1';
+    const runs = archivedOnly
+      ? all.filter((run) => run.archived)
+      : all.filter((run) => !run.archived);
+    sendJson(response, 200, { runs });
+    return;
+  }
+  if (path === '/api/practice') {
+    sendJson(
+      response,
+      200,
+      options.practice
+        ? await practiceAvailability(options.practice)
+        : {
+            available: false,
+            problem: 'This inspector was started without practice configuration.',
+          },
+    );
     return;
   }
   if (path === '/api/upload') {
-    // Whether the action can run, and why not. Never any credential.
+    // Whether the action can run, and why not. Never any credential. The
+    // console origin rides along, so the UI can link to a registered workflow
+    // without the server learning anything per-request.
     const availability = options.upload
       ? await uploadAvailability(options.upload)
       : {
           available: false,
           problem: 'This inspector was started without upload configuration.',
         };
-    sendJson(response, 200, availability);
+    const console = workflowConsole(options.upload?.env ?? process.env);
+    sendJson(response, 200, {
+      ...availability,
+      consoleUrl: console.consoleUrl,
+      exact: console.exact,
+    });
     return;
   }
   if (path === '/api/generate') {
-    // What the dialog may choose, and whether either provider can run. Reports
-    // presence of credentials, never their values.
+    // What the dialog may choose. Reports credential presence, never values.
     sendJson(
       response,
       200,
@@ -119,8 +159,7 @@ async function route(options: UiOptions, url: URL, response: ServerResponse) {
         : {
             available: false,
             problem: 'This inspector was started without generation configuration.',
-            providers: [],
-            models: { openai: [], codex: [] },
+            models: [],
             reasoningEfforts: [],
             timeoutMs: 0,
             running: null,
@@ -238,6 +277,98 @@ function refuseWrite(request: IncomingMessage, response: ServerResponse, what: s
   return false;
 }
 
+// The authorized write that moves a run aside instead of destroying it:
+// archive one discovered run, restoreable afterward. Reversible, so the same
+// loopback and same-origin rules apply, but no permanent loss is possible.
+async function handleArchive(
+  options: UiOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+  runId: string,
+) {
+  if (refuseWrite(request, response, 'Archive')) {
+    return;
+  }
+  if (!(await discardBody(request))) {
+    sendJson(response, 413, { error: 'Archive takes no request body.' });
+    return;
+  }
+  try {
+    const moved = await archiveRun(options.root, runId);
+    if (moved) {
+      sendJson(response, 200, { archived: runId, archivedId: moved });
+    } else {
+      sendJson(response, 404, { error: `No discovered run "${runId}".` });
+    }
+  } catch {
+    sendJson(response, 500, { error: 'Archive failed.' });
+  }
+}
+
+// The reverse write: move an archived run back to where discovery first found
+// it. Same guards, same reversibility.
+async function handleRestore(
+  options: UiOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+  runId: string,
+) {
+  if (refuseWrite(request, response, 'Restore')) {
+    return;
+  }
+  if (!(await discardBody(request))) {
+    sendJson(response, 413, { error: 'Restore takes no request body.' });
+    return;
+  }
+  try {
+    const restored = await restoreRun(options.root, runId);
+    if (restored) {
+      sendJson(response, 200, { restored, fromId: runId });
+    } else {
+      sendJson(
+        response,
+        404,
+        runId.startsWith('archive~')
+          ? { error: `No archived run "${runId}".` }
+          : { error: 'That id is not an archived run; only archived runs can be restored.' },
+      );
+    }
+  } catch {
+    sendJson(response, 500, { error: 'Restore failed.' });
+  }
+}
+
+// The one authorized write that mutates local recorded state: delete one run
+// from the records the inspector discovers. It is irreversible from the
+// inspector, and the destructive request format is a double confirmation of
+// both the target and the intent. Upload and generation remain the only other
+// writes.
+async function handleDelete(
+  options: UiOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+  runId: string,
+) {
+  if (refuseWrite(request, response, 'Delete')) {
+    return;
+  }
+  // The empty body is enforced with the same bound as the other writes.
+  if (!(await discardBody(request))) {
+    sendJson(response, 413, { error: 'Delete takes no request body.' });
+    return;
+  }
+  try {
+    const removed = await deleteRun(options.root, runId);
+    if (removed) {
+      sendJson(response, 200, { deleted: runId });
+    } else {
+      sendJson(response, 404, { error: `No discovered run "${runId}".` });
+    }
+  } catch {
+    sendJson(response, 500, { error: 'Delete failed.' });
+  }
+}
+
 // The one authorized write that registers remotely: register an already
 // compiled workflow. Credentials stay in this process, the run id must be one
 // the scan discovered, and the operation runs under a bounded deadline.
@@ -270,8 +401,8 @@ async function handleUpload(
   }
 }
 
-// The second authorized write: start one generation with the provider, model,
-// and reasoning effort chosen in the browser. It runs the same generation a CLI
+// The second authorized write: start one generation with the model and reasoning
+// effort chosen in the browser. It runs the same generation a CLI
 // `generate` runs, under the same recipe deadline, and answers with the run id
 // so the inspector can navigate to the trace it is already writing.
 async function handleGenerate(
@@ -305,6 +436,35 @@ async function handleGenerate(
   }
 }
 
+async function handlePractice(
+  options: UiOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+  runId: string,
+) {
+  if (refuseWrite(request, response, 'Practice')) {
+    return;
+  }
+  if (!options.practice) {
+    sendJson(response, 503, {
+      error: 'This inspector was started without practice configuration.',
+    });
+    return;
+  }
+  const body = await readJsonBody(request);
+  if (!body) {
+    sendJson(response, 413, { error: 'Testing takes a small JSON body of choices only.' });
+    return;
+  }
+  try {
+    sendJson(response, 202, { practiceJob: await startPractice(options.practice, runId, body) });
+  } catch (error) {
+    sendJson(response, error instanceof PracticeError ? error.status : 500, {
+      error: error instanceof PracticeError ? error.message : 'Testing could not be started.',
+    });
+  }
+}
+
 // A malformed percent escape must not escape the request handler.
 function safePath(url: URL): string {
   try {
@@ -318,12 +478,53 @@ export function createUiServer(options: UiOptions) {
   return createServer((request: IncomingMessage, response: ServerResponse) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
     const path = safePath(url);
+    const practice = /^\/api\/runs\/([^/]+)\/practice$/.exec(path);
+    if (request.method === 'POST' && practice) {
+      handlePractice(options, request, response, practice[1]).catch(() => {
+        if (!response.headersSent) {
+          sendJson(response, 500, { error: 'Testing could not be started.' });
+        }
+      });
+      return;
+    }
     const upload = /^\/api\/runs\/([^/]+)\/upload$/.exec(path);
     if (request.method === 'POST' && upload) {
       handleUpload(options, request, response, upload[1]).catch(() => {
         if (!response.headersSent) {
           sendJson(response, 500, { error: 'Upload failed.' });
         }
+      });
+      return;
+    }
+    const archive = /^\/api\/runs\/([^/]+)\/archive$/.exec(path);
+    if (request.method === 'POST' && archive) {
+      // Archiving is advertised when granted, so the UI can always show it,
+      // but the server remains the authority on whether it runs.
+      if (options.allowArchive) {
+        handleArchive(options, request, response, archive[1]).catch(() => {
+          if (!response.headersSent) {
+            sendJson(response, 500, { error: 'Archive failed.' });
+          }
+        });
+        return;
+      }
+      sendJson(response, 405, {
+        error: 'This inspector was started without --allow-archive; archiving is disabled.',
+      });
+      return;
+    }
+    const restore = /^\/api\/runs\/([^/]+)\/restore$/.exec(path);
+    if (request.method === 'POST' && restore) {
+      if (options.allowArchive) {
+        handleRestore(options, request, response, restore[1]).catch(() => {
+          if (!response.headersSent) {
+            sendJson(response, 500, { error: 'Restore failed.' });
+          }
+        });
+        return;
+      }
+      sendJson(response, 405, {
+        error: 'This inspector was started without --allow-archive; restoring is disabled.',
       });
       return;
     }
@@ -335,11 +536,25 @@ export function createUiServer(options: UiOptions) {
       });
       return;
     }
+    if (request.method === 'DELETE') {
+      const run = /^\/api\/runs\/([^/]+)$/.exec(path);
+      // Deletion is a destructive, local-only action, so it is granted, not
+      // inferred from other configuration.
+      if (run && options.allowDelete) {
+        handleDelete(options, request, response, run[1]).catch(() => {
+          if (!response.headersSent) {
+            sendJson(response, 500, { error: 'Delete failed.' });
+          }
+        });
+        return;
+      }
+    }
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      // Recorded runs stay read-only; POST is accepted only on the two
-      // authorized actions, upload and generation.
+      // Recorded state is read-only, except for the authorized writes: upload,
+      // generation, delete, and archive/restore.
       sendJson(response, 405, {
-        error: 'The inspector is read-only except for the upload and generation actions.',
+        error:
+          'The inspector is read-only except for the upload, generation, practice, delete, and archive actions.',
       });
       return;
     }

@@ -1,31 +1,23 @@
+import { createOpenAI } from '@ai-sdk/openai';
+import { generateText, jsonSchema, Output, streamText } from 'ai';
 import type { Candidate, Generator, Task } from './contracts.ts';
-import { candidateSchema, object } from './validation.ts';
-import { recipe } from './recipe.ts';
+import { object } from './validation.ts';
 import { normalizeUsage } from './usage.ts';
 import type { TokenUsage } from './usage.ts';
 
 export type CallRecord = {
-  endpoint: string;
-  baseUrl?: string;
-  request: unknown;
+  endpoint: 'responses';
+  baseUrl: string;
+  request?: unknown;
   response?: unknown;
   error?: string;
   elapsedMs: number;
-  // Normalized from whichever shape the provider reported, so every run record
-  // totals the same way regardless of provider.
+  // Normalized from the API payload so every run record totals the same way.
   usage?: TokenUsage;
 };
 
 export type ModelEvent = {
-  kind:
-    | 'accepted'
-    | 'reasoning'
-    | 'summary'
-    | 'draft'
-    | 'completed'
-    | 'incomplete'
-    | 'failed'
-    | 'status';
+  kind: 'accepted' | 'reasoning' | 'summary' | 'draft' | 'completed' | 'incomplete' | 'failed';
   text?: string;
   usage?: unknown;
   reason?: string;
@@ -38,7 +30,6 @@ export const reasoningEfforts = [
   'high',
   'xhigh',
   'max',
-  'ultra',
 ] as const;
 export type ReasoningEffort = (typeof reasoningEfforts)[number];
 export function parseReasoningEffort(value: string | undefined): ReasoningEffort | undefined {
@@ -62,23 +53,39 @@ export type GenerationDefinition = {
   reasoningEffort?: ReasoningEffort;
 };
 
+export function createOpenAIGenerator(
+  model: string,
+  definition: GenerationDefinition,
+  transport: typeof fetch = fetch,
+) {
+  if (!model.trim()) {
+    throw new Error('Live runs require --model or BUILDER_MODEL.');
+  }
+  if (!process.env.OPENAI_API_KEY?.trim()) {
+    throw new Error('Live runs require OPENAI_API_KEY and --model or BUILDER_MODEL.');
+  }
+  return new OpenAIGenerator(
+    process.env.OPENAI_API_KEY,
+    model,
+    transport,
+    definition,
+    process.env.OPENAI_BASE_URL?.trim() || undefined,
+  );
+}
+
 export class OpenAIGenerator implements Generator {
   calls: CallRecord[] = [];
-  apiKey: string;
-  model: string;
-  transport: typeof fetch;
-  definition: GenerationDefinition;
-  baseUrl: string;
+  private readonly apiKey: string;
+  readonly model: string;
+  private readonly definition: GenerationDefinition;
+  private readonly baseUrl: string;
+  private readonly provider: ReturnType<typeof createOpenAI>;
+  private activeCall: CallRecord | undefined;
   constructor(
     apiKey: string,
     model: string,
-    transport: typeof fetch = fetch,
-    definition: GenerationDefinition = {
-      instructions: recipe.instructions,
-      schema: candidateSchema,
-      maxOutputTokens: recipe.limits.maxOutputTokens,
-      maxCalls: recipe.limits.maxCalls,
-    },
+    transport: typeof fetch,
+    definition: GenerationDefinition,
     baseUrl = 'https://api.openai.com/v1',
   ) {
     if (!apiKey.trim()) {
@@ -88,12 +95,8 @@ export class OpenAIGenerator implements Generator {
       throw new Error('BUILDER_MODEL must be explicitly configured.');
     }
     parseReasoningEffort(definition.reasoningEffort);
-    if (definition.reasoningEffort === 'ultra') {
-      throw new Error('reasoning-effort ultra is supported only by the codex provider.');
-    }
     this.apiKey = apiKey;
     this.model = model;
-    this.transport = transport;
     this.definition = definition;
     let url: URL;
     try {
@@ -113,34 +116,28 @@ export class OpenAIGenerator implements Generator {
       );
     }
     this.baseUrl = url.href.replace(/\/+$/, '');
+    this.provider = createOpenAI({
+      apiKey,
+      baseURL: this.baseUrl,
+      // Keep redirects closed so an authenticated request cannot be forwarded.
+      fetch: async (input, init) => {
+        if (this.activeCall && typeof init?.body === 'string') {
+          this.activeCall.request = JSON.parse(init.body);
+          this.definition.onCall?.(this.activeCall);
+        }
+        return transport(input, { ...init, redirect: 'error' });
+      },
+    });
+  }
+  private emit(event: ModelEvent) {
+    this.definition.onEvent?.({
+      ...event,
+      ...(event.text ? { text: event.text.replaceAll(this.apiKey, '[REDACTED]') } : {}),
+    });
   }
   async generate(task: Task, signal: AbortSignal): Promise<unknown> {
-    const request = {
-      model: this.model,
-      store: false,
-      instructions: this.definition.instructions,
-      input: JSON.stringify({ task }),
-      max_output_tokens: this.definition.maxOutputTokens,
-      ...(this.definition.onEvent ? { stream: true } : {}),
-      ...(this.definition.reasoningSummary || this.definition.reasoningEffort
-        ? {
-            reasoning: {
-              ...(this.definition.reasoningSummary ? { summary: 'auto' } : {}),
-              ...(this.definition.reasoningEffort
-                ? { effort: this.definition.reasoningEffort }
-                : {}),
-            },
-          }
-        : {}),
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'builder_output',
-          strict: true,
-          schema: this.definition.schema,
-        },
-      },
-    };
+    const streamed = Boolean(this.definition.onEvent);
+    const prompt = JSON.stringify({ task });
     signal.throwIfAborted();
     if (this.calls.length >= this.definition.maxCalls) {
       throw new Error('Model call budget exhausted.');
@@ -149,168 +146,156 @@ export class OpenAIGenerator implements Generator {
     const call: CallRecord = {
       endpoint: 'responses',
       baseUrl: this.baseUrl,
-      request,
       elapsedMs: 0,
     };
     this.calls.push(call);
+    this.activeCall = call;
+    let responseBody: unknown;
     try {
       this.definition.onCall?.(call);
-      const response = await this.transport(`${this.baseUrl}/responses`, {
-        method: 'POST',
-        redirect: 'error',
-        signal,
-        headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
-      // Do not echo server error bodies: they can contain request data or credentials.
-      if (!response.ok) {
-        throw new Error(`Responses API HTTP ${response.status}`);
-      }
-      const emit = (event: ModelEvent) =>
-        this.definition.onEvent?.({
-          ...event,
-          ...(event.text ? { text: event.text.replaceAll(this.apiKey, '[REDACTED]') } : {}),
+      const model = this.provider.responses(this.model);
+      const settings = {
+        model,
+        prompt,
+        abortSignal: signal,
+        maxRetries: 0,
+        streamRetries: 0,
+        maxOutputTokens: this.definition.maxOutputTokens,
+        output: Output.object({
+          name: 'builder_output',
+          schema: jsonSchema(this.definition.schema as Parameters<typeof jsonSchema>[0]),
+        }),
+        providerOptions: {
+          openai: {
+            instructions: this.definition.instructions,
+            store: false,
+            strictJsonSchema: true,
+            ...(this.definition.reasoningEffort
+              ? { reasoningEffort: this.definition.reasoningEffort, forceReasoning: true }
+              : {}),
+            ...(this.definition.reasoningSummary && !this.definition.reasoningEffort
+              ? { forceReasoning: true }
+              : {}),
+            ...(this.definition.reasoningSummary
+              ? { reasoningSummary: 'auto' }
+              : this.definition.reasoningEffort && this.definition.reasoningEffort !== 'none'
+                ? { reasoningSummary: null }
+                : {}),
+          },
+        },
+      };
+
+      let output: unknown;
+      if (streamed) {
+        const result = streamText({
+          ...settings,
+          include: { requestBody: true, rawChunks: true },
         });
-      const streaming = response.headers.get('content-type')?.includes('text/event-stream');
-      const result: unknown = streaming
-        ? await streamedResponse(response, emit, signal)
-        : await response.json();
-      call.response = result;
-      // Record usage before any validation can throw, so a rejected or
-      // truncated response still reports what it cost.
-      const usage = normalizeUsage(object(result) ? result.usage : undefined);
-      if (usage) {
-        call.usage = usage;
-      }
-      if (object(result) && (result.status === 'incomplete' || result.status === 'failed')) {
-        emit({ kind: result.status, reason: incompleteReason(result), usage: result.usage });
-      }
-      const candidate = responseJSON(result);
-      if (!streaming && object(result) && Array.isArray(result.output)) {
-        for (const item of result.output) {
-          if (object(item) && item.type === 'reasoning' && Array.isArray(item.summary)) {
-            for (const part of item.summary) {
-              if (object(part) && part.type === 'summary_text' && typeof part.text === 'string') {
-                emit({ kind: 'summary', text: part.text });
-              }
+        for await (const part of result.stream) {
+          if (part.type === 'raw' && object(part.rawValue)) {
+            const type = part.rawValue.type;
+            if (type === 'response.created') {
+              this.emit({ kind: 'accepted' });
+            } else if (type === 'response.refusal.delta' || type === 'response.refusal.done') {
+              throw new Error('Model refused generation.');
+            } else if (
+              (type === 'response.completed' ||
+                type === 'response.incomplete' ||
+                type === 'response.failed') &&
+              object(part.rawValue.response)
+            ) {
+              responseBody = part.rawValue.response;
             }
+          } else if (part.type === 'reasoning-start') {
+            this.emit({ kind: 'reasoning' });
+          } else if (part.type === 'reasoning-delta') {
+            this.emit({ kind: 'summary', text: part.text });
+          } else if (part.type === 'text-delta') {
+            this.emit({ kind: 'draft', text: part.text });
+          } else if (part.type === 'error') {
+            throw part.error;
+          }
+        }
+        const [requestMetadata, responseMetadata] = await Promise.all([
+          result.request,
+          result.response,
+        ]);
+        if (call.request === undefined) {
+          call.request = requestMetadata.body;
+        }
+        responseBody ??= responseMetadata.body;
+        output = result.output;
+      } else {
+        const result = await generateText({
+          ...settings,
+          include: { requestBody: true, responseBody: true },
+        });
+        if (call.request === undefined) {
+          call.request = result.request.body;
+        }
+        responseBody = result.response.body;
+        output = result.output;
+        for (const part of await result.reasoning) {
+          if (part.type === 'reasoning') {
+            this.emit({ kind: 'summary', text: part.text });
           }
         }
       }
-      emit({ kind: 'completed', usage: object(result) ? result.usage : undefined });
-      return candidate;
+
+      call.response = responseBody;
+      const usage = normalizeUsage(object(responseBody) ? responseBody.usage : undefined);
+      if (usage) {
+        call.usage = usage;
+      }
+      if (
+        object(responseBody) &&
+        (responseBody.status === 'incomplete' || responseBody.status === 'failed')
+      ) {
+        this.emit({
+          kind: responseBody.status,
+          reason: incompleteReason(responseBody),
+          usage: responseBody.usage,
+        });
+      }
+      assertCompletedResponse(responseBody);
+      this.emit({ kind: 'completed', usage: responseBody.usage });
+      return output;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown transport failure';
+      if (call.request === undefined && object(error) && object(error.requestBodyValues)) {
+        call.request = error.requestBodyValues;
+      }
+      responseBody ??= responseFromError(error);
+      if (responseBody) {
+        call.response = responseBody;
+        const usage = normalizeUsage(object(responseBody) ? responseBody.usage : undefined);
+        if (usage) {
+          call.usage = usage;
+        }
+      }
+      const status =
+        object(error) && typeof error.statusCode === 'number' && error.statusCode >= 400
+          ? error.statusCode
+          : null;
+      const message = status
+        ? `Responses API HTTP ${status}`
+        : error instanceof Error
+          ? error.message
+          : object(error) && typeof error.message === 'string'
+            ? error.message
+            : typeof error === 'string'
+              ? error
+              : 'Unknown model provider failure';
       call.error = message.replaceAll(this.apiKey, '[REDACTED]');
       throw new Error(call.error);
     } finally {
+      this.activeCall = undefined;
       call.elapsedMs = Math.round(performance.now() - started);
       this.definition.onCall?.(call);
     }
   }
 }
 
-// Parse SSE incrementally, including fragmented UTF-8, CRLF, comments, and multiline data.
-async function* streamEvents(response: Response, signal: AbortSignal): AsyncGenerator<unknown> {
-  if (!response.body) {
-    throw new Error('OpenAI response stream has no body.');
-  }
-  const reader = response.body.getReader();
-  const abort = () => {
-    void reader.cancel().catch(() => {});
-  };
-  signal.addEventListener('abort', abort, { once: true });
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let data: string[] = [];
-  const parse = () => {
-    const text = data.join('\n');
-    data = [];
-    if (!text || text === '[DONE]') {
-      return undefined;
-    }
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error('Malformed OpenAI stream event.');
-    }
-  };
-  try {
-    while (true) {
-      signal.throwIfAborted();
-      const chunk = await reader.read();
-      signal.throwIfAborted();
-      buffer += chunk.done
-        ? decoder.decode() + '\n\n'
-        : decoder.decode(chunk.value, { stream: true });
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, newline).replace(/\r$/, '');
-        buffer = buffer.slice(newline + 1);
-        if (line === '') {
-          const event = parse();
-          if (event !== undefined) {
-            yield event;
-          }
-        } else if (line.startsWith('data:')) {
-          data.push(line.slice(5).replace(/^ /, ''));
-        }
-      }
-      if (chunk.done) {
-        break;
-      }
-    }
-  } finally {
-    signal.removeEventListener('abort', abort);
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
-}
-
-async function streamedResponse(
-  response: Response,
-  emit: (event: ModelEvent) => void,
-  signal: AbortSignal,
-): Promise<unknown> {
-  for await (const event of streamEvents(response, signal)) {
-    if (!object(event)) {
-      continue;
-    }
-    switch (event.type) {
-      case 'response.created':
-        emit({ kind: 'accepted' });
-        break;
-      case 'response.output_item.added':
-        if (object(event.item) && event.item.type === 'reasoning') {
-          emit({ kind: 'reasoning' });
-        }
-        break;
-      case 'response.reasoning_summary_text.delta':
-        if (typeof event.delta === 'string') {
-          emit({ kind: 'summary', text: event.delta });
-        }
-        break;
-      case 'response.output_text.delta':
-        if (typeof event.delta === 'string') {
-          emit({ kind: 'draft', text: event.delta });
-        }
-        break;
-      case 'response.completed':
-      case 'response.incomplete':
-      case 'response.failed':
-        return event.response;
-      case 'response.refusal.delta':
-      case 'response.refusal.done':
-        throw new Error('Model refused generation.');
-      case 'error':
-        throw new Error('OpenAI response stream failed.');
-    }
-  }
-  // Never promote partial JSON, even if it happens to parse, without a completion event.
-  throw new Error('OpenAI stream ended before a completed response.');
-}
-
-export function responseJSON(response: unknown): unknown {
+function assertCompletedResponse(response: unknown): asserts response is Record<string, unknown> {
   if (!object(response) || response.status !== 'completed' || !Array.isArray(response.output)) {
     const reason = object(response) ? incompleteReason(response) : undefined;
     const usage = object(response) && object(response.usage) ? response.usage : {};
@@ -322,33 +307,18 @@ export function responseJSON(response: unknown): unknown {
         ? `; reasoning tokens: ${details.reasoning_tokens}`
         : '';
     throw new Error(
-      `Response did not complete${reason ? ` (reason: ${reason}${tokens}${reasoning})` : ''}; no candidate accepted.${reason === 'max_output_tokens' ? ' The output budget includes reasoning; increase freyaRecipe.limits.maxOutputTokens in src/recipe.ts.' : ''}`,
+      response === undefined
+        ? 'OpenAI stream ended before a completed response.'
+        : `Response did not complete${reason ? ` (reason: ${reason}${tokens}${reasoning})` : ''}; no candidate accepted.${reason === 'max_output_tokens' ? ' The output budget includes reasoning; increase freyaRecipe.limits.maxOutputTokens in src/recipe.ts.' : ''}`,
     );
   }
-  const parts: string[] = [];
   for (const item of response.output) {
     if (!object(item) || item.type !== 'message' || !Array.isArray(item.content)) {
       continue;
     }
-    for (const part of item.content) {
-      if (!object(part)) {
-        continue;
-      }
-      if (part.type === 'refusal') {
-        throw new Error('Model refused generation.');
-      }
-      if (part.type === 'output_text' && typeof part.text === 'string') {
-        parts.push(part.text);
-      }
+    if (item.content.some((part) => object(part) && part.type === 'refusal')) {
+      throw new Error('Model refused generation.');
     }
-  }
-  if (!parts.length) {
-    throw new Error('Response contained no output text.');
-  }
-  try {
-    return JSON.parse(parts.join(''));
-  } catch {
-    throw new Error('Response text was not valid JSON.');
   }
 }
 
@@ -358,6 +328,13 @@ function incompleteReason(response: Record<string, unknown>): string | undefined
     : undefined;
   // Only report known API reasons; never echo arbitrary server error bodies.
   return reason === 'max_output_tokens' || reason === 'content_filter' ? reason : undefined;
+}
+
+function responseFromError(error: unknown): Record<string, unknown> | undefined {
+  if (!object(error) || !object(error.response)) {
+    return undefined;
+  }
+  return object(error.response.body) ? error.response.body : undefined;
 }
 
 // Plumbing fixture only. This does not demonstrate task-solving performance.

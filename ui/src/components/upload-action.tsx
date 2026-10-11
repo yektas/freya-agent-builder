@@ -1,11 +1,50 @@
 import * as React from 'react';
-import { CloudUpload, LoaderCircle, TriangleAlert, Upload as UploadIcon } from 'lucide-react';
+import {
+  CloudUpload,
+  ExternalLink,
+  LoaderCircle,
+  TriangleAlert,
+  Upload as UploadIcon,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ms, when } from '@/lib/data';
 import type { RunDetail, Upload } from '@/lib/data';
 
-type Availability = { available: boolean; problem: string | null };
+type Availability = {
+  available: boolean;
+  problem: string | null;
+  /** Dashboard origin, or the configured per-workflow URL template. */
+  consoleUrl?: string | null;
+  /** True when consoleUrl is a per-workflow template, not just the origin. */
+  exact?: boolean;
+};
 type UploadResponse = { upload?: Upload; error?: string };
+
+/**
+ * Link for one uploaded run's workflow. With FREYA_WORKFLOW_URL set, the
+ * console answer is a per-workflow template and the ids substitute in; without
+ * it, only the dashboard origin is known, deep-link routes being undocumented,
+ * and the link points there honestly labeled.
+ */
+function workflowLink(availability: Availability | null, upload: Upload) {
+  if (!upload.workflowId) {
+    return null;
+  }
+  const consoleUrl = availability?.consoleUrl;
+  if (!consoleUrl) {
+    return null;
+  }
+  if (availability?.exact) {
+    return {
+      href: consoleUrl
+        .replaceAll('{workflowId}', upload.workflowId)
+        .replaceAll('{agentId}', upload.agentId ?? '')
+        .replaceAll('{workspaceId}', upload.workspaceId ?? ''),
+      label: 'Open in Freya',
+    };
+  }
+  return { href: consoleUrl, label: 'Open Freya dashboard' };
+}
 
 /**
  * Only a completed generation has a compiled workflow that was never sent to
@@ -94,7 +133,9 @@ export function UploadAction({ detail }: { detail: RunDetail }) {
       <Button
         variant="outline"
         size="sm"
-        disabled={pending || blocked}
+        disabled={
+          pending || blocked || detail.summary.archived || detail.practiceJob?.status === 'running'
+        }
         onClick={upload}
         className="mr-2 align-middle"
       >
@@ -123,19 +164,40 @@ export function UploadAction({ detail }: { detail: RunDetail }) {
         </p>
       )}
 
-      {result && registered && (
-        <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-lg border border-success/25 bg-success/5 px-3 py-2">
-          <span className="text-[11px] font-medium text-success">
-            {result.reused ? 'Already registered' : 'Registered on Freya'}
-          </span>
-          <Item label="slot" value={result.slot} />
-          <Item label="workflow" value={result.workflowId} />
-          <Item label="agent" value={result.agentId} />
-          <Item label="version" value={result.version === null ? null : String(result.version)} />
-          <Item label="when" value={when(result.endedAt ?? result.startedAt)} />
-          <Item label="took" value={ms(result.elapsedMs)} />
-        </div>
-      )}
+      {result &&
+        registered &&
+        (() => {
+          const link = workflowLink(availability, result);
+          return (
+            <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-lg border border-success/25 bg-success/5 px-3 py-2">
+              <span className="text-[11px] font-medium text-success">
+                {result.reused ? 'Already registered' : 'Registered on Freya'}
+              </span>
+              <Item label="slot" value={result.slot} />
+              <Item label="workflow" value={result.workflowId} />
+              <Item label="agent" value={result.agentId} />
+              <Item
+                label="version"
+                value={result.version === null ? null : String(result.version)}
+              />
+              <Item label="when" value={when(result.endedAt ?? result.startedAt)} />
+              <Item label="took" value={ms(result.elapsedMs)} />
+              {link && (
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={`Opens ${link.href}`}
+                  className="inline-flex items-center gap-1 text-[11px] font-medium text-primary underline-offset-2 hover:underline"
+                >
+                  <ExternalLink className="size-3" />
+                  {link.label}
+                  {!availability?.exact && ' (workflow id on the record)'}
+                </a>
+              )}
+            </div>
+          );
+        })()}
 
       {error && (
         <div className="mt-2 overflow-hidden rounded-lg border border-destructive/30 bg-destructive/5">

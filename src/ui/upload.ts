@@ -12,6 +12,7 @@ import { hash } from '../experiments.ts';
 import { FreyaBridge } from '../freya.ts';
 import { object } from '../validation.ts';
 import { readRunArtifact } from './records.ts';
+import { practiceActive } from './activity.ts';
 
 // Artifacts the upload reads and writes inside an already discovered run.
 const COMPILED = 'compiled.workflow.json';
@@ -125,6 +126,30 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Console link info for a registered workflow. Freya's dashboard is an SPA whose
+ * deep-link routes are not documented (verified: only /api/v2 endpoints are),
+ * so the per-workflow route is configuration: FREYA_WORKFLOW_URL, with
+ * {workflowId}, {agentId}, and {workspaceId} placeholders, for example
+ * https://app.freyavoice.ai/workflows/{workflowId}. FREYA_API_URL supplies the
+ * fallback dashboard origin. The template is answered once as "consoleUrl"; ids
+ * from a run's upload record are substituted client-side, never sent to the
+ * server.
+ */
+export function workflowConsole(env: NodeJS.ProcessEnv): {
+  /** Dashboard origin, or the configured per-workflow template. */
+  consoleUrl: string | null;
+  /** True when consoleUrl is a per-workflow template, not just the origin. */
+  exact: boolean;
+} {
+  const template = env.FREYA_WORKFLOW_URL?.trim();
+  if (template) {
+    return { consoleUrl: template, exact: true };
+  }
+  const origin = env.FREYA_API_URL?.trim();
+  return origin ? { consoleUrl: origin, exact: false } : { consoleUrl: null, exact: false };
+}
+
 // Upload needs the workspace key and the event package. Practice testing, which
 // also needs the bank team key, is a separate action and is not offered here.
 export async function uploadAvailability(options: UploadOptions): Promise<{
@@ -211,6 +236,9 @@ export function uploadRun(options: UploadOptions, runId: string): Promise<Upload
 
 async function register(options: UploadOptions, runId: string): Promise<UploadView> {
   const root = resolve(options.root);
+  if (practiceActive(root, runId)) {
+    throw new UploadError(409, 'This generation is being tested. Wait for practice to finish.');
+  }
   const kit = resolve(options.kit);
   const env = options.env ?? process.env;
   const timeoutMs = clampTimeout(options.timeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS);

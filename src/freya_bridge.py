@@ -123,7 +123,7 @@ def main():
         cache.mkdir(parents=True, exist_ok=True)
         runner.ROOT = cache
         # Exact original case file; persistent persona cache is scoped to the verified workspace.
-        sys.argv = ['run_cases.py', request['agentId'], '--cases', request['casesPath'], '--out', request['path'], '--reps', '1']
+        sys.argv = ['run_cases.py', request['agentId'], '--cases', request['casesPath'], '--out', request['path'], '--reps', str(request.get('repetitions', 1))]
         for flag, key in [('--brief', 'brief'), ('--only', 'only'), ('--style', 'style')]:
             if request.get(key):
                 sys.argv.extend([flag, request[key]])

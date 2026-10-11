@@ -41,6 +41,7 @@ function inspectorApi(port: number): Plugin {
           // Same upload configuration as the served inspector; credentials stay
           // in this process and the browser only receives ids.
           upload: { root: experiments, kit },
+          practice: { root: experiments, kit },
           // Same generation configuration, so New run works in dev.
           generation: { root: experiments, kit, openapi: join(kit, 'tools/openapi.json') },
         });

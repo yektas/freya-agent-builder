@@ -11,12 +11,15 @@ import { PracticeTab } from '@/components/practice-tab';
 import { StagesTab, WorkflowTab } from '@/components/tabs';
 import { CandidateTab, FilesTab, TraceTab } from '@/components/simple-tabs';
 import { UploadAction } from '@/components/upload-action';
+import { PracticeAction } from '@/components/practice-action';
+import { RowAction } from '@/components/delete-run';
+import { Archive as ArchiveIcon } from 'lucide-react';
 import { isRunning, kindLabel, when } from '@/lib/data';
 import type { RunDetail, RunSummary, StartedRun } from '@/lib/data';
 import { usePoller } from '@/lib/hooks';
 
-const fetchRuns = async (): Promise<{ runs: RunSummary[] }> => {
-  const response = await fetch('/api/runs');
+const fetchRuns = async (query: string): Promise<{ runs: RunSummary[] }> => {
+  const response = await fetch(`/api/runs${query}`);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 };
@@ -27,7 +30,17 @@ const fetchDetail = async (id: string): Promise<RunDetail> => {
   return response.json();
 };
 
-function Detail({ detail, onBack }: { detail: RunDetail; onBack: () => void }) {
+function Detail({
+  detail,
+  onBack,
+  onArchived,
+  onRestored,
+}: {
+  detail: RunDetail;
+  onBack: () => void;
+  onArchived: (id: string, archivedId: string) => void;
+  onRestored: (id: string) => void;
+}) {
   const s = detail.summary;
   const [tab, setTab] = React.useState('overview');
   const [node, setNode] = React.useState<string | null>(null);
@@ -72,9 +85,22 @@ function Detail({ detail, onBack }: { detail: RunDetail; onBack: () => void }) {
             <ArrowLeft className="size-3.5" />
             All runs
           </Button>
+          <RowAction
+            id={s.id}
+            archived={s.archived}
+            disabled={isRunning(s)}
+            onArchived={onArchived}
+            onRestored={onRestored}
+          />
+          {s.archived && (
+            <span className="mt-1 inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              <ArchiveIcon className="size-3" /> archived — restorable
+            </span>
+          )}
         </div>
         {/* Remount per run so a pending request or result never leaks across runs. */}
         <UploadAction key={detail.summary.id} detail={detail} />
+        <PracticeAction key={`practice-${detail.summary.id}`} detail={detail} />
         <Tabs value={tab} onValueChange={setTab}>
           <TabsList className="mt-3 h-auto gap-0.5 bg-transparent p-0">
             {tabs.map(([value, label]) => (
@@ -105,6 +131,7 @@ function Detail({ detail, onBack }: { detail: RunDetail; onBack: () => void }) {
 export function App() {
   const [runs, setRuns] = React.useState<RunSummary[]>([]);
   const [filter, setFilter] = React.useState('all');
+  const [archivedView, setArchivedView] = React.useState(false);
   const [id, setId] = React.useState<string | null>(null);
   const [detail, setDetail] = React.useState<RunDetail | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -115,7 +142,8 @@ export function App() {
 
   usePoller({
     interval: listInterval,
-    fetcher: fetchRuns,
+    // The list endpoint serves one bucket at a time; the toggle switches which.
+    fetcher: () => fetchRuns(archivedView ? '?archived=1' : ''),
     onData: (data) => {
       setRuns(data.runs);
       setError(null);
@@ -149,6 +177,30 @@ export function App() {
     setDetail(null);
     location.hash = '';
   };
+  // An archived run leaves whichever list is open; if it was open in detail,
+  // the detail view also closes, so no stale panel survives the move.
+  const onArchived = React.useCallback(
+    (removedId: string) => {
+      setRuns((current) => current.filter((run) => run.id !== removedId));
+      if (id === removedId) {
+        back();
+      }
+    },
+    [id],
+  );
+  // A restored run reappears in the main list at the next poll; closing the
+  // detail view makes the switch visible immediately.
+  const onRestored = React.useCallback(
+    (restoredId: string) => {
+      setRuns((current) => current.filter((run) => run.id !== restoredId));
+      if (id === restoredId) {
+        back();
+      }
+      // Jump to the live list so the user sees where the run went.
+      setArchivedView(false);
+    },
+    [id],
+  );
   // A started run is addressed by the same id the list uses, so it opens
   // immediately and keeps streaming into view while the model is still writing.
   const started = React.useCallback((run: StartedRun) => {
@@ -177,12 +229,26 @@ export function App() {
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           {error && <p className="p-4 text-xs text-destructive">{error}</p>}
           {!id && !error && (
-            <RunTable runs={visible} selected={id} onSelect={select} onStarted={started} />
+            <RunTable
+              runs={visible}
+              selected={id}
+              archivedView={archivedView}
+              onToggleArchived={(show) => {
+                setArchivedView(show);
+                setFilter('all');
+              }}
+              onSelect={select}
+              onStarted={started}
+              onArchived={onArchived}
+              onRestored={onRestored}
+            />
           )}
           {id && !detail && (
             <p className="p-10 text-center text-xs text-muted-foreground">Loading run…</p>
           )}
-          {id && detail && <Detail detail={detail} onBack={back} />}
+          {id && detail && (
+            <Detail detail={detail} onBack={back} onArchived={onArchived} onRestored={onRestored} />
+          )}
         </main>
       </SidebarProvider>
     </TooltipProvider>

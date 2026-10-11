@@ -68,18 +68,7 @@ test('a run whose whole prompt is a cache write is recorded as such', () => {
   assert.equal(over?.cacheWriteTokens, 40);
 });
 
-test('normalizes the Codex payload and rejects payloads with no token counts', () => {
-  assert.deepEqual(
-    normalizeUsage({ input_tokens: 20, cached_input_tokens: 8, output_tokens: 30 }),
-    {
-      inputTokens: 20,
-      cachedInputTokens: 8,
-      cacheWriteTokens: 0,
-      outputTokens: 30,
-      reasoningTokens: 0,
-      totalTokens: 50,
-    },
-  );
+test('ignores absent or empty usage payloads', () => {
   for (const empty of [undefined, null, {}, 'usage', { input_tokens: 0, output_tokens: 0 }]) {
     assert.equal(normalizeUsage(empty), null);
   }

@@ -1,11 +1,16 @@
-// Read-only discovery and normalization of run records for the inspector UI.
-// Three writers produce records under the output directory; each is mapped to one
+import type { PracticeJob } from './practice.ts';
+import { practiceActive } from './activity.ts';
+// Discovery and normalization of run records for the inspector UI. Three
+// writers produce records under the output directory; each is mapped to one
 // summary and one detail shape so the UI never branches on which command ran.
-import { readdir, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+// Mutations are the authorized archive and restore actions, which move a run in
+// and out of the archive folder rather than destroying anything; reading
+// otherwise stays read-only.
+import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import { object } from '../validation.ts';
-import { projectRoot } from '../experiments.ts';
-import { estimateCost, hasUsage, normalizeUsage, sumUsage } from '../usage.ts';
+import { hash, projectRoot } from '../experiments.ts';
+import { estimateCost, hasUsage, normalizeUsage } from '../usage.ts';
 
 export type RunKind = 'freya-live-run' | 'generation-only' | 'local-build';
 
@@ -19,8 +24,8 @@ export type EvaluationView = {
   details: string | null;
 };
 
-// Token counts plus a cost estimate. `usd` is null when the run predates cost
-// tracking, made no model call, or names a model this snapshot has no price for.
+// Token counts plus the recorded cost estimate. `usd` is null when there was no
+// model call or the model has no price in this snapshot.
 export type UsageView = {
   inputTokens: number;
   cachedInputTokens: number;
@@ -51,6 +56,8 @@ export type RunSummary = {
   slot: string | null;
   taskId: string | null;
   synthetic: boolean;
+  archived: boolean;
+  practiceStatus?: 'running' | 'completed' | 'failed' | null;
   evaluation: EvaluationView;
   usage: UsageView | null;
   error: string | null;
@@ -84,7 +91,6 @@ export type NodeView = {
 };
 
 export type WorkflowView = {
-  source: 'compiled' | 'exported' | 'recorded';
   initialNode: string | null;
   systemPrompt: string | null;
   contextVariables: string[];
@@ -173,6 +179,7 @@ export type RunDetail = {
   // The workflow document exactly as recorded, for copying into a submission.
   workflowJson: string | null;
   practice: PracticeView | null;
+  practiceJob: PracticeJob | null;
   calls: CallView[];
   trace: TraceEntryView[];
   candidate: CandidateView | null;
@@ -197,8 +204,11 @@ export type DiscoveredRun = {
 };
 
 // Directories under the output root that hold state or probes, not reviewable runs.
-const SKIP_DIRS = new Set(['freya-state', 'freya-probe', 'generation']);
+const SKIP_DIRS = new Set(['freya-state', 'freya-probe', 'generation', 'archive']);
 const GENERATION_DIR = 'generation';
+// Runs the inspector archived live here rather than being deleted; the restore
+// action moves them back.
+const ARCHIVE_DIR = 'archive';
 // '~' cannot appear in the generated ids we create, so it reverses unambiguously.
 const ID_SEPARATOR = '~';
 
@@ -213,6 +223,9 @@ const GENERATION_FILES = [
   'platform.jsonl',
   'exported.workflow.json',
   'upload.json',
+  'practice.json',
+  'practice-job.json',
+  'practice-history.json',
 ];
 
 function text(value: unknown): string | null {
@@ -368,7 +381,6 @@ function walk(raw: unknown): WorkflowView {
   const workflow = record(raw);
   const initialNode = text(workflow.initial_node);
   const view: WorkflowView = {
-    source: 'recorded',
     initialNode,
     systemPrompt: text(workflow.system_prompt),
     contextVariables: Object.keys(record(workflow.context_variables)),
@@ -434,14 +446,25 @@ function practiceView(raw: unknown): PracticeView | null {
   if (passed === null && total === null && !rows.length) {
     return null;
   }
+  const finalRows = list(result.final);
   const cases: PracticeCaseView[] = rows.map((item) => {
     const row = record(item);
+    const final = finalRows.map(record).find((entry) => entry.id === row.id);
+    const attempts = list(result.all_rows)
+      .flatMap((items) => list(items).map(record))
+      .filter((entry) => entry.id === row.id);
     return {
       id: String(row.id ?? 'unknown'),
       level: text(row.level),
       family: text(row.family),
-      pass: row.pass === true,
-      failed: strings(row.failed),
+      pass: final ? final.pass === true : row.pass === true,
+      failed: [
+        ...new Set(
+          attempts.length
+            ? attempts.flatMap((entry) => strings(entry.failed))
+            : strings(row.failed),
+        ),
+      ],
       tools: strings(row.tools),
       callId: text(row.call_id),
     };
@@ -575,39 +598,18 @@ function evaluationView(raw: unknown, fallback: Partial<EvaluationView>): Evalua
   };
 }
 
-// Runs recorded before usage tracking still carry the provider's own payload in
-// each call response, so tokens can be recovered; only the cost cannot, because
-// pricing is applied at write time.
-function usageView(run: Record<string, unknown>, model: string | null): UsageView | null {
+function usageView(run: Record<string, unknown>): UsageView | null {
   const recorded = record(run.usage);
-  let calls = 0;
-  const tokens = sumUsage(
-    list(run.calls).map((item) => {
-      const call = record(item);
-      calls++;
-      return (
-        normalizeUsage(call.usage) ??
-        normalizeUsage(record(call.response).usage) ??
-        normalizeUsage(record(record(call.response).response).usage)
-      );
-    }),
-  );
-  if (!hasUsage(tokens) && !object(recorded.tokens)) {
+  const tokens = normalizeUsage(recorded.tokens);
+  if (!hasUsage(tokens)) {
     return null;
   }
-  const stored = hasUsage(normalizeUsage(recorded.tokens))
-    ? normalizeUsage(recorded.tokens)!
-    : tokens;
   const cost = record(recorded.cost);
-  const usd = whole(cost.usd);
-  // A record written before cost tracking still gets an estimate, priced with
-  // today's table and labeled so the number is not mistaken for a billed one.
-  const estimate = usd !== null ? usd : estimateCost(stored, model).usd;
   return {
-    ...stored,
-    calls,
-    usd: estimate,
-    costSource: usd !== null ? (text(cost.source) ?? 'recorded') : 'estimated',
+    ...tokens,
+    calls: list(run.calls).length,
+    usd: whole(cost.usd),
+    costSource: text(cost.source) ?? 'unknown',
   };
 }
 
@@ -616,6 +618,7 @@ function summarize(
   kind: RunKind,
   raw: unknown,
   files: RunFile[],
+  archived = false,
 ): { summary: RunSummary; parsed: Record<string, unknown> } {
   const run = record(raw);
   const task = record(run.task);
@@ -654,8 +657,9 @@ function summarize(
     slot: text(config.slot),
     taskId: text(task.id),
     synthetic: task.synthetic === true,
+    archived,
     evaluation,
-    usage: usageView(run, model),
+    usage: usageView(run),
     error,
     counts: {
       nodes: nodeCount,
@@ -686,23 +690,97 @@ async function discoverDir(directory: string, id: string, kind: RunKind, names: 
   } satisfies DiscoveredRun;
 }
 
+type RunStatus = { run: DiscoveredRun; archived: boolean };
+
 // Walks the output directory. Live runs are directories holding run.json,
-// generation traces live one level deeper, and the internal build baseline
-// writes a single JSON file per run.
-export async function discoverRuns(root: string): Promise<DiscoveredRun[]> {
+// generation traces live one level deeper, the internal build baseline writes a
+// single JSON file per run, and archived runs live under the archive folder in
+// the same shapes they had when they were discovered.
+async function scan(root: string): Promise<RunStatus[]> {
   let entries;
   try {
     entries = await readdir(root, { withFileTypes: true });
   } catch {
     return [];
   }
-  const found: DiscoveredRun[] = [];
+  const found: RunStatus[] = [];
+  const push = async (run: DiscoveredRun | null, archived: boolean) => {
+    if (run) {
+      found.push({ run, archived });
+    }
+  };
   for (const entry of entries) {
     if (entry.name.startsWith('.')) {
       continue;
     }
     const path = join(root, entry.name);
     if (entry.isDirectory()) {
+      // The archive folder holds moved runs. Each archived name is
+      // <timestamp>__<originalId>[.json], so the original id (which may itself
+      // carry the generation marker) is recovered after the '__'; the kind
+      // follows from that id, and the file lists match live discovery so a
+      // restored run reads exactly as it did before it was archived.
+      if (entry.name === ARCHIVE_DIR) {
+        let nested;
+        try {
+          nested = await readdir(path, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const child of nested) {
+          if (child.name.startsWith('.')) {
+            continue;
+          }
+          // The scan id carries the full timestamped name, matching what
+          // archiveRun answered, so the id the client holds stays addressable;
+          // the original id is recovered after the first '__' (the timestamp
+          // has no underscores; the original id may itself contain '~').
+          const originalId = child.name
+            .replace(/\.json$/, '')
+            .split('__')
+            .slice(1)
+            .join('__');
+          const childPath = join(path, child.name);
+          const scanId = `archive${ID_SEPARATOR}${child.name.replace(/\.json$/, '')}`;
+          if (child.isDirectory()) {
+            const generation = originalId.startsWith(`${GENERATION_DIR}${ID_SEPARATOR}`);
+            const run = await discoverDir(
+              childPath,
+              scanId,
+              generation ? 'generation-only' : 'freya-live-run',
+              generation
+                ? GENERATION_FILES
+                : [
+                    'run.json',
+                    'compiled.workflow.json',
+                    'exported.workflow.json',
+                    'practice.json',
+                    'platform.jsonl',
+                  ],
+            );
+            if (run) {
+              found.push({ run, archived: true });
+            }
+            continue;
+          }
+          if (!child.name.endsWith('.json')) {
+            continue;
+          }
+          const info = await stat(childPath);
+          found.push({
+            run: {
+              id: scanId,
+              kind: 'local-build',
+              runPath: path,
+              runFile: childPath,
+              filePaths: { [child.name]: childPath },
+              files: [{ name: child.name, bytes: info.size }],
+            },
+            archived: true,
+          });
+        }
+        continue;
+      }
       if (entry.name === GENERATION_DIR) {
         let nested;
         try {
@@ -714,15 +792,15 @@ export async function discoverRuns(root: string): Promise<DiscoveredRun[]> {
           if (!child.isDirectory() || child.name.startsWith('.')) {
             continue;
           }
-          const run = await discoverDir(
-            join(path, child.name),
-            `${GENERATION_DIR}${ID_SEPARATOR}${child.name}`,
-            'generation-only',
-            GENERATION_FILES,
+          await push(
+            await discoverDir(
+              join(path, child.name),
+              `${GENERATION_DIR}${ID_SEPARATOR}${child.name}`,
+              'generation-only',
+              GENERATION_FILES,
+            ),
+            false,
           );
-          if (run) {
-            found.push(run);
-          }
         }
         continue;
       }
@@ -736,9 +814,7 @@ export async function discoverRuns(root: string): Promise<DiscoveredRun[]> {
         'practice.json',
         'platform.jsonl',
       ]);
-      if (run) {
-        found.push(run);
-      }
+      await push(run, false);
       continue;
     }
     if (!entry.name.endsWith('.json') || entry.name === 'package.json') {
@@ -746,51 +822,212 @@ export async function discoverRuns(root: string): Promise<DiscoveredRun[]> {
     }
     const name = entry.name;
     found.push({
-      id: name.replace(/\.json$/, ''),
-      kind: 'local-build',
-      runPath: root,
-      runFile: path,
-      filePaths: { [name]: path },
-      files: [{ name, bytes: (await stat(path)).size }],
+      run: {
+        id: name.replace(/\.json$/, ''),
+        kind: 'local-build',
+        runPath: root,
+        runFile: path,
+        filePaths: { [name]: path },
+        files: [{ name, bytes: (await stat(path)).size }],
+      },
+      archived: false,
     });
   }
   return found;
 }
 
-export async function listRuns(root: string): Promise<RunSummary[]> {
+export async function discoverRuns(root: string): Promise<DiscoveredRun[]> {
+  return (await scan(root)).map((item) => item.run);
+}
+
+// Removes one discovered run. The id must come from the same scan the reads
+// use, so a crafted id never reaches the filesystem. A single-file build record
+// is unlinked directly, because its parent directory holds unrelated runs; a
+// directory run is removed with everything written beside its run.json, which
+// is exactly that run's own artifacts.
+export async function deleteRun(root: string, id: string): Promise<boolean> {
   const runs = await discoverRuns(root);
+  const run = runs.find((item) => item.id === id);
+  if (!run) {
+    return false;
+  }
+  if (practiceActive(root, id) || (await practiceBusy(run))) {
+    throw new Error('Cannot delete a run while practice is running.');
+  }
+  if (run.kind === 'local-build') {
+    await rm(run.filePaths[run.files[0].name]);
+  } else {
+    await rm(run.runPath, { recursive: true, force: true });
+  }
+  return true;
+}
+
+// Moves one discovered run into the archive folder instead of destroying it.
+// The id must come from the same scan the reads use, so a crafted id never
+// reaches the filesystem, and an archived run is refused: restoring, not
+// re-archiving, is the way back. A single-file build record is moved alone,
+// because its parent directory holds unrelated runs. Answers with the scan id
+// the archived run carries afterwards.
+export async function archiveRun(root: string, id: string): Promise<string | null> {
+  const runs = await discoverRuns(root);
+  const run = runs.find((item) => item.id === id);
+  if (!run || id.startsWith(`archive${ID_SEPARATOR}`)) {
+    return null;
+  }
+  if (practiceActive(root, id) || (await practiceBusy(run))) {
+    throw new Error('Cannot archive a run while practice is running.');
+  }
+  const destination = join(resolve(root), ARCHIVE_DIR);
+  await mkdir(destination, { recursive: true });
+  // The timestamp keeps two archives of one id from overwriting each other,
+  // and the '__' marker separates the timestamp from the original id on a
+  // restore.
+  const name = `${new Date().toISOString().replace(/[:.]/g, '-')}__${id}`;
+  if (run.kind === 'local-build') {
+    await rename(run.filePaths[run.files[0].name], join(destination, `${name}.json`));
+  } else {
+    await rename(run.runPath, join(destination, name));
+  }
+  return `${ARCHIVE_DIR}${ID_SEPARATOR}${name}`;
+}
+
+// Moves one archived run back to where it lived before the archive, under its
+// original id. The id is the archived scan id, so only something this scan
+// discovered can be restored, and a destination already occupied by a run that
+// appeared after the archive is never overwritten.
+export async function restoreRun(root: string, id: string): Promise<string | null> {
+  const runs = await discoverRuns(root);
+  const run = runs.find((item) => item.id === id);
+  if (!run || !id.startsWith(`archive${ID_SEPARATOR}`)) {
+    return null;
+  }
+  // The archived name is <timestamp>__<originalId>[.json]; the original id may
+  // itself contain the '~' separator (a generation run), so it is reassembled
+  // from everything after the first '__'.
+  const leaf = (run.kind === 'local-build' ? run.filePaths[run.files[0].name] : run.runPath)
+    .split(sep)
+    .at(-1)!
+    .replace(/\.json$/, '');
+  const original = leaf.split('__').slice(1).join('__');
+  if (!original || original.includes('/') || original.includes(sep)) {
+    return null;
+  }
+  // A generation run restores under generation/; anything else restores at the
+  // top of the records root, where discovery first saw it.
+  const generationPrefix = `${GENERATION_DIR}${ID_SEPARATOR}`;
+  const destination = original.startsWith(generationPrefix)
+    ? join(resolve(root), GENERATION_DIR, original.slice(generationPrefix.length))
+    : join(resolve(root), original);
+  if (await existsPath(destination)) {
+    return null;
+  }
+  const source = run.kind === 'local-build' ? run.filePaths[run.files[0].name] : run.runPath;
+  await rename(source, destination);
+  return original;
+}
+
+async function existsPath(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function listRuns(root: string): Promise<RunSummary[]> {
+  return listRunsDetailed(root).then((all) => all.map((item) => item.summary));
+}
+
+// Detail plus archive flag: the archive filter needs to know, and the route
+// needs to split the answer.
+export async function listRunsDetailed(
+  root: string,
+): Promise<{ summary: RunSummary; archived: boolean }[]> {
+  const statuses = await scan(root);
   const summaries = await Promise.all(
-    runs.map(
-      async (run) =>
-        (await summarize(run.id, run.kind, await readJson(run.runFile), run.files)).summary,
-    ),
+    statuses.map(async (item) => {
+      const { summary } = await summarize(
+        item.run.id,
+        item.run.kind,
+        await readJson(item.run.runFile),
+        item.run.files,
+        item.archived,
+      );
+      await attachPractice(item.run, summary);
+      return { summary, archived: item.archived };
+    }),
   );
   return summaries.sort(
-    (a, b) => (Date.parse(b.startedAt ?? '') || 0) - (Date.parse(a.startedAt ?? '') || 0),
+    (a, b) =>
+      (Date.parse(b.summary.startedAt ?? '') || 0) - (Date.parse(a.summary.startedAt ?? '') || 0),
   );
 }
 
-// Resolves the workflow once and returns both the normalized graph and the exact
-// JSON as recorded, so the inspector can show the submitted document and not only
-// its own reading of it. Runs predating the standalone artifact still resolve
-// through the value embedded in the run record.
-async function loadWorkflow(run: DiscoveredRun, parsed: Record<string, unknown>) {
+async function practiceBusy(run: DiscoveredRun): Promise<boolean> {
+  if (!run.filePaths['practice-job.json']) {
+    return false;
+  }
+  return record(await readJson(run.filePaths['practice-job.json'])).status === 'running';
+}
+
+// Practice is a separate artifact: generation timing and model usage stay intact.
+async function attachPractice(
+  run: DiscoveredRun,
+  summary: RunSummary,
+): Promise<PracticeJob | null> {
+  if (!run.filePaths['practice-job.json']) {
+    return null;
+  }
+  const job = record(await readJson(run.filePaths['practice-job.json']));
+  if (!['running', 'completed', 'failed'].includes(String(job.status))) {
+    return null;
+  }
+  summary.practiceStatus = job.status as PracticeJob['status'];
+  const upload = record(await readJson(run.filePaths['upload.json']));
+  const compiled = await readJson(run.filePaths['compiled.workflow.json']);
+  const current =
+    upload.status === 'registered' &&
+    job.workflowHash === upload.workflowHash &&
+    job.agentId === upload.agentId &&
+    object(compiled) &&
+    hash(compiled) === job.workflowHash;
+  const result =
+    current && job.status === 'completed'
+      ? practiceView(await readJson(run.filePaths['practice.json']))
+      : null;
+  summary.evaluation =
+    result && result.total > 0
+      ? {
+          score: result.passed / result.total,
+          passed: result.passed,
+          total: result.total,
+          source: 'official-practice',
+          details: `${job.brief === 'all' ? 'A+B' : job.brief} practice; ${job.repetitions} repetition(s); ${job.style ?? 'normal'} speech. Public cases, not the hidden final benchmark.`,
+        }
+      : {
+          score: null,
+          passed: null,
+          total: null,
+          source: 'not-evaluated',
+          details: !current
+            ? 'Registration changed since testing; test the current upload again.'
+            : job.status === 'running'
+              ? 'Practice testing is running.'
+              : 'The latest practice attempt failed; previous results remain in practice-history.json.',
+        };
+  return job as unknown as PracticeJob;
+}
+
+// The compiled artifact is the workflow submitted to Freya and generation
+// deliverable shown by the inspector.
+async function loadWorkflow(run: DiscoveredRun) {
   const raw = await readJson(join(run.runPath, 'compiled.workflow.json'));
   if (object(raw)) {
     return {
-      view: { ...walk(raw), source: 'compiled' as const },
+      view: walk(raw),
       json: JSON.stringify(raw, null, 2),
     };
-  }
-  const exported = await readJson(join(run.runPath, 'exported.workflow.json'));
-  if (object(exported)) {
-    return {
-      view: { ...walk(exported), source: 'exported' as const },
-      json: JSON.stringify(exported, null, 2),
-    };
-  }
-  if (object(parsed.workflow)) {
-    return { view: walk(parsed.workflow), json: JSON.stringify(parsed.workflow, null, 2) };
   }
   return { view: null, json: null };
 }
@@ -807,14 +1044,15 @@ export async function loadRun(root: string, id: string): Promise<RunDetail | nul
     await readJson(run.runFile),
     run.files,
   );
-  const workflow = await loadWorkflow(run, parsed);
-  const practiceFile = await readJson(join(run.runPath, 'practice.json'));
+  const workflow = await loadWorkflow(run);
+  const practiceJob = await attachPractice(run, summary);
+  const practiceFile =
+    practiceJob && summary.evaluation.score === null
+      ? null
+      : await readJson(join(run.runPath, 'practice.json'));
   const calls = list(parsed.calls).map((item) => {
     const call = record(item);
-    const tokens =
-      normalizeUsage(call.usage) ??
-      normalizeUsage(record(call.response).usage) ??
-      normalizeUsage(record(record(call.response).response).usage);
+    const tokens = normalizeUsage(call.usage);
     return {
       endpoint: String(call.endpoint ?? 'unknown'),
       elapsedMs: whole(call.elapsedMs),
@@ -841,12 +1079,13 @@ export async function loadRun(root: string, id: string): Promise<RunDetail | nul
     stages: stageView(parsed.stages),
     workflow: workflow.view,
     workflowJson: workflow.json,
-    practice: practiceView(object(practiceFile) ? practiceFile : parsed.practice),
+    practice: practiceView(practiceFile),
+    practiceJob,
     calls,
     trace: traceView(await readJsonLines(join(run.runPath, 'trace.jsonl'))),
     candidate: candidateView(pickCandidate(parsed)),
     workflowCandidate: uncertainties(rawCandidate),
-    upload: uploadView(object(uploadFile) ? uploadFile : parsed.upload),
+    upload: uploadView(uploadFile),
     issues: strings(record(parsed.build).issues),
     source: object(parsed.source)
       ? {

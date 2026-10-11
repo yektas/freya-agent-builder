@@ -1,13 +1,22 @@
 // Offline tests for the inspector: fixtures are written to a temp directory and
 // no model, platform, or network call is made.
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
+import { stat } from 'node:fs/promises';
+import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, test } from 'node:test';
-import { discoverRuns, listRuns, loadRun, readRunFile } from '../src/ui/records.ts';
+import {
+  archiveRun,
+  discoverRuns,
+  listRuns,
+  loadRun,
+  readRunFile,
+  restoreRun,
+} from '../src/ui/records.ts';
 import { createUiServer } from '../src/ui/server.ts';
 
 // The inspector UI is a Vite bundle. Build it at most once per test process so
@@ -225,7 +234,7 @@ test('discovers live runs, generation traces, and build records', async () => {
   ]);
 });
 
-test('surfaces recorded token usage and prices runs that never recorded a cost', async () => {
+test('surfaces stored usage and cost, and omits usage when no model call ran', async () => {
   const root = await fixture();
   // A current run: usage already written to the record, priced at write time.
   const priced = join(root, 'priced');
@@ -265,30 +274,6 @@ test('surfaces recorded token usage and prices runs that never recorded a cost',
       },
     }),
   );
-  // A run recorded before usage tracking: only the provider's own payload remains.
-  const legacy = join(root, 'legacy');
-  await mkdir(legacy, { recursive: true });
-  await writeFile(
-    join(legacy, 'run.json'),
-    JSON.stringify({
-      kind: 'generation-only',
-      status: 'completed',
-      startedAt: '2026-10-09T12:00:00.000Z',
-      task: { id: 'brief-b', tools: [] },
-      config: { model: 'gpt-5' },
-      calls: [
-        {
-          endpoint: 'responses',
-          request: {},
-          elapsedMs: 1000,
-          response: {
-            status: 'completed',
-            usage: { input_tokens: 500, output_tokens: 100, total_tokens: 600 },
-          },
-        },
-      ],
-    }),
-  );
   // A run with no model call at all.
   const mock = join(root, 'mock');
   await mkdir(mock, { recursive: true });
@@ -311,13 +296,6 @@ test('surfaces recorded token usage and prices runs that never recorded a cost',
   assert.equal(pricedRun?.usage?.costSource, 'table');
   assert.equal(pricedRun?.usage?.calls, 1);
 
-  // Tokens recovered from the recorded response; cost derived and labeled as such.
-  const legacyRun = summaries.find((run) => run.id === 'legacy');
-  assert.equal(legacyRun?.usage?.totalTokens, 600);
-  assert.equal(legacyRun?.usage?.costSource, 'estimated');
-  // 500 input at $1.25/M + 100 output at $10/M.
-  assert.ok(Math.abs((legacyRun?.usage?.usd ?? 0) - (500 * 0.00000125 + 100 * 0.00001)) < 1e-12);
-
   assert.equal(summaries.find((run) => run.id === 'mock')?.usage, null);
 
   const detail = await loadRun(root, 'priced');
@@ -335,7 +313,6 @@ test('walks the workflow graph and reports structural observations', async () =>
   const detail = await loadRun(root, 'live-1');
   assert.ok(detail?.workflow);
   const workflow = detail.workflow;
-  assert.equal(workflow.source, 'compiled');
   assert.equal(workflow.initialNode, 'greeting');
   assert.deepEqual(workflow.contextVariables, ['verified']);
   assert.deepEqual(workflow.lifecycleTools, ['close_call']);
@@ -390,7 +367,6 @@ test('surfaces the exact workflow JSON for a generation run', async () => {
       kind: 'generation-only',
       status: 'completed',
       startedAt: '2026-10-10T11:00:00.000Z',
-      workflow,
     }),
   );
   await writeFile(join(dir, 'compiled.workflow.json'), JSON.stringify(workflow, null, 2));
@@ -400,30 +376,9 @@ test('surfaces the exact workflow JSON for a generation run', async () => {
   assert.ok(summary.files.some((file) => file.name === 'compiled.workflow.json'));
 
   const detail = await loadRun(root, 'generation~gen-workflow');
-  assert.equal(detail?.workflow?.source, 'compiled');
   // Byte-for-byte the recorded document, so it can be submitted as generated.
   assert.equal(detail?.workflowJson, JSON.stringify(workflow, null, 2));
   assert.equal(JSON.parse(detail?.workflowJson ?? '{}').initial_node, 'greeting');
-});
-
-// Runs recorded before the standalone artifact existed still expose the workflow
-// embedded in run.json, so no recorded run becomes unreadable.
-test('falls back to the workflow embedded in the run record', async () => {
-  const root = await fixture();
-  const dir = join(root, 'generation', 'gen-legacy');
-  await mkdir(dir, { recursive: true });
-  const workflow = {
-    initial_node: 'only',
-    nodes: { only: { node_type: 'end_call', transitions: [] } },
-  };
-  await writeFile(
-    join(dir, 'run.json'),
-    JSON.stringify({ kind: 'generation-only', status: 'completed', workflow }),
-  );
-
-  const detail = await loadRun(root, 'generation~gen-legacy');
-  assert.equal(detail?.workflow?.source, 'recorded');
-  assert.equal(detail?.workflowJson, JSON.stringify(workflow, null, 2));
 });
 
 test('renders practice rows with failure reasons', async () => {
@@ -572,6 +527,339 @@ test('surfaces a failed run and its error without a practice result', async () =
   assert.equal(detail?.summary.evaluation.score, null);
   assert.equal(detail?.practice, null);
   assert.equal(detail?.workflow, null);
+});
+
+test('archiveRun and restoreRun work at the records level, with guards', async () => {
+  const root = await fixture();
+  await seedFreyaRun(root);
+  const genDir = join(root, 'generation', 'gen-roundtrip');
+  await mkdir(genDir, { recursive: true });
+  await writeFile(
+    join(genDir, 'run.json'),
+    JSON.stringify({ kind: 'generation-only', status: 'completed' }),
+  );
+
+  // Directory run.
+  const archivedLive = await archiveRun(root, 'live-1');
+  assert.ok(archivedLive?.startsWith('archive~'));
+  assert.equal(await loadRun(root, 'live-1'), null);
+  // Generation run: the '~' inside its own id must survive the round trip.
+  const archivedGen = await archiveRun(root, 'generation~gen-roundtrip');
+  assert.ok(archivedGen?.includes('generation~gen-roundtrip'));
+  // Unknown and already-archived ids are inert.
+  assert.equal(await archiveRun(root, 'nope'), null);
+  assert.equal(await archiveRun(root, archivedLive!), null);
+
+  // Restore puts each back under its discovery id.
+  assert.equal(await restoreRun(root, archivedLive!), 'live-1');
+  assert.ok(await loadRun(root, 'live-1'));
+  assert.equal(await restoreRun(root, 'live-1'), null); // not archived
+  assert.equal(
+    (await restoreRun(root, archivedGen!.replace(/^.+?__/, 'archive~x__'))) ?? null,
+    null,
+  ); // fabricated id is unknown
+  const archivedGenRecord = archivedGen!;
+  assert.equal(await restoreRun(root, archivedGenRecord), 'generation~gen-roundtrip');
+  await stat(genDir); // back at its generation/ address
+  // A restore of an id the scan never saw does nothing.
+  assert.equal(await restoreRun(root, 'archive~made-up'), null);
+  // An occupied destination is never overwritten.
+  const secondArchive = await archiveRun(root, 'live-1');
+  assert.ok(secondArchive);
+  await mkdir(join(root, 'live-1'), { recursive: true });
+  await writeFile(join(root, 'live-1', 'sentinel.txt'), 'newer');
+  assert.equal(await restoreRun(root, secondArchive!), null); // refused
+  assert.equal((await stat(join(root, 'live-1', 'sentinel.txt'))).size, 5); // untouched
+  await rm(join(root, 'live-1'), { recursive: true });
+  assert.equal(await restoreRun(root, secondArchive!), 'live-1');
+});
+
+test('archive moves a run to the archive and restore brings it back intact', async () => {
+  const root = await fixture();
+  await seedFreyaRun(root);
+  const genDir = join(root, 'generation', 'gen-arch');
+  await mkdir(genDir, { recursive: true });
+  await writeFile(
+    join(genDir, 'run.json'),
+    JSON.stringify({
+      kind: 'generation-only',
+      status: 'completed',
+      startedAt: '2026-10-10T11:00:00.000Z',
+    }),
+  );
+  await writeFile(join(root, 'build-arch.json'), JSON.stringify({ createdAt: 'x', build: {} }));
+
+  const server = createUiServer({ root, port: 0, host: '127.0.0.1', allowArchive: true });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+  const base = await serverAddress(server);
+  try {
+    // Every kind archives, and each is visible through the archived listing
+    // afterwards, out of the live one.
+    const live = await fetch(`${base}/api/runs/live-1/archive`, { method: 'POST' });
+    assert.equal(live.status, 200);
+    const liveBody = (await live.json()) as { archivedId?: string };
+    assert.ok(liveBody.archivedId?.startsWith('archive~'));
+    assert.ok(!(await listRuns(root)).some((run) => run.id === 'live-1'));
+    const archived = (await listRuns(root)).filter((run) => run.archived);
+    assert.ok(archived.some((run) => run.id === liveBody.archivedId));
+    await stat(join(root, 'archive'));
+
+    const gen = await fetch(
+      `${base}/api/runs/${encodeURIComponent('generation~gen-arch')}/archive`,
+      { method: 'POST' },
+    );
+    assert.equal(gen.status, 200);
+    const build = await fetch(`${base}/api/runs/build-arch/archive`, { method: 'POST' });
+    assert.equal(build.status, 200);
+    // The moved single-file record left the root.
+    await stat(join(root, 'archive', 'build-arch.json')).catch(() => {
+      // The name is timestamped; find it by shape instead.
+    });
+    assert.equal((await readdirArchiveBuilds(root)).length, 1);
+
+    // Restore puts the run back under the same id, and the archived copy is
+    // consumed, so nothing lingers in two places.
+    const restored = await fetch(
+      `${base}/api/runs/${encodeURIComponent(liveBody.archivedId!)}/restore`,
+      { method: 'POST' },
+    );
+    assert.equal(restored.status, 200);
+    assert.deepEqual(await restored.json(), {
+      restored: 'live-1',
+      fromId: liveBody.archivedId,
+    });
+    const back = await listRuns(root);
+    assert.ok(back.some((run) => run.id === 'live-1' && !run.archived));
+    // The restored run is fully usable again: detail and artifacts load.
+    const detail = await loadRun(root, 'live-1');
+    assert.equal(detail?.workflow?.initialNode, 'greeting');
+
+    // Nothing was ever destroyed: archive + restore is a round trip. The gen
+    // and build records remain in the archive, restorable later.
+    assert.equal((await listRuns(root)).length, 3);
+  } finally {
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+});
+
+// Recount the archived single-file build records by inode name shape.
+async function readdirArchiveBuilds(root: string): Promise<string[]> {
+  try {
+    return (await readdir(join(root, 'archive'))).filter((name) => name.endsWith('.json'));
+  } catch {
+    return [];
+  }
+}
+
+async function serverAddress(server: import('node:http').Server): Promise<string> {
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  return `http://127.0.0.1:${address.port}`;
+}
+
+test('archive and restore are guarded like every other write', async () => {
+  const root = await fixture();
+  await seedFreyaRun(root);
+  await mkdir(join(root, 'archive', '2026-01-01T00-00-00-000Z__live-1'), { recursive: true });
+  await writeFile(
+    join(root, 'archive', '2026-01-01T00-00-00-000Z__live-1', 'run.json'),
+    JSON.stringify({ kind: 'freya-live-run', status: 'completed' }),
+  );
+
+  const guarded = createUiServer({ root, port: 0, host: '127.0.0.1' });
+  await new Promise<void>((done) => guarded.listen(0, '127.0.0.1', done));
+  const base = await serverAddress(guarded);
+  try {
+    const archive = await fetch(`${base}/api/runs/live-1/archive`, { method: 'POST' });
+    assert.equal(archive.status, 405);
+    await stat(join(root, 'live-1', 'run.json'));
+    const restore = await fetch(
+      `${base}/api/runs/${encodeURIComponent('archive~2026-01-01T00-00-00-000Z__live-1')}/restore`,
+      { method: 'POST' },
+    );
+    await stat(join(root, 'archive', '2026-01-01T00-00-00-000Z__live-1', 'run.json'));
+    // Whether 405 or 404, the archived run is still in the archive.
+    assert.ok(restore.status >= 400);
+  } finally {
+    await new Promise<void>((done) => guarded.close(() => done()));
+  }
+
+  const allowed = createUiServer({ root, port: 0, host: '127.0.0.1', allowArchive: true });
+  await new Promise<void>((done) => allowed.listen(0, '127.0.0.1', done));
+  const allowedBase = await serverAddress(allowed);
+  try {
+    //Archive takes no body.
+    const bloated = await fetch(`${allowedBase}/api/runs/live-1/archive`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: 'x'.repeat(10000),
+    });
+    assert.equal(bloated.status, 413);
+    await stat(join(root, 'live-1', 'run.json'));
+
+    // A restore of an unknown archived id is refused outright.
+    const missing = await fetch(
+      `${allowedBase}/api/runs/${encodeURIComponent('archive~absent-thing')}/restore`,
+      { method: 'POST' },
+    );
+    assert.equal(missing.status, 404);
+
+    // A restore of a live id (not archived) is refused with a clear reason.
+    const notArchived = await fetch(`${allowedBase}/api/runs/live-1/restore`, {
+      method: 'POST',
+    });
+    assert.equal(notArchived.status, 404);
+  } finally {
+    await new Promise<void>((done) => allowed.close(() => done()));
+  }
+});
+
+test('delete removes a discovered run and refuses anything else', async () => {
+  const root = await fixture();
+  await seedFreyaRun(root);
+  const genDir = join(root, 'generation', 'gen-delete');
+  await mkdir(genDir, { recursive: true });
+  await writeFile(
+    join(genDir, 'run.json'),
+    JSON.stringify({ kind: 'generation-only', status: 'completed' }),
+  );
+  await writeFile(join(root, 'build-delete.json'), JSON.stringify({ createdAt: 'x', build: {} }));
+  // State the inspector never treats as a run must survive any delete.
+  await mkdir(join(root, 'freya-state', 'protected'), { recursive: true });
+  await writeFile(join(root, 'freya-state', 'protected', 'slots.json'), '{}');
+
+  // A run directory with extra untracked files survives deletion of a sibling
+  // run, and everything belonging to the deleted run goes with it.
+  const extra = join(root, 'keep-extras');
+  await mkdir(extra, { recursive: true });
+  await writeFile(
+    join(extra, 'run.json'),
+    JSON.stringify({ kind: 'freya-live-run', status: 'completed' }),
+  );
+  await writeFile(join(extra, 'scratch.txt'), 'not a run artifact');
+  // A directory under generation/ with no run.json is not a discovered run; a
+  // delete request for it is refused, so it must survive untouched.
+  const halfway = join(root, 'generation', 'halfway');
+  await mkdir(halfway, { recursive: true });
+  await writeFile(join(halfway, 'trace.jsonl'), '{}\n');
+
+  const server = createUiServer({ root, port: 0, host: '127.0.0.1', allowDelete: true });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const base = `http://127.0.0.1:${address.port}`;
+
+  try {
+    // The collection endpoint never grows a delete route of its own.
+    const collection = await fetch(`${base}/api/runs`, { method: 'DELETE' });
+    assert.equal(collection.status, 405);
+
+    // A half-written generation directory is never a deletion target.
+    const absent = await fetch(`${base}/api/runs/generation~halfway`, { method: 'DELETE' });
+    assert.equal(absent.status, 404);
+    await stat(join(root, 'generation', 'halfway', 'trace.jsonl'));
+
+    // A directory run is removed with its artifacts.
+    const live = await fetch(`${base}/api/runs/live-1`, { method: 'DELETE' });
+    assert.equal(live.status, 200);
+    assert.deepEqual(await live.json(), { deleted: 'live-1' });
+    await assert.rejects(stat(join(root, 'live-1')));
+    assert.ok(!(await listRuns(root)).some((run) => run.id === 'live-1'));
+
+    // The sibling run with an unrecorded extra file is untouched by another's
+    // deletion, and stays discoverable (and deletable) across restarts.
+    const before = (await listRuns(root)).map((run) => run.id);
+    assert.ok(before.includes('keep-extras'));
+    await stat(join(root, 'keep-extras', 'scratch.txt'));
+
+    // A generation trace is removed from its nested directory.
+    const gen = await fetch(`${base}/api/runs/generation~gen-delete`, { method: 'DELETE' });
+    assert.equal(gen.status, 200);
+    await assert.rejects(stat(genDir));
+
+    // A single-file build record is unlinked without touching its siblings.
+    const build = await fetch(`${base}/api/runs/build-delete`, { method: 'DELETE' });
+    assert.equal(build.status, 200);
+    await assert.rejects(stat(join(root, 'build-delete.json')));
+
+    const survivors = (await listRuns(root)).map((run) => run.id);
+    // The extras-bearing run is still there and still deletable.
+    const extras = await fetch(`${base}/api/runs/keep-extras`, { method: 'DELETE' });
+    assert.equal(extras.status, 200);
+    await assert.rejects(stat(join(root, 'keep-extras')));
+    assert.ok(!survivors.some((id) => id.startsWith('halfway')));
+
+    // An id outside the scan is refused, not guessed at.
+    const unknown = await fetch(`${base}/api/runs/never-discovered`, { method: 'DELETE' });
+    assert.equal(unknown.status, 404);
+
+    // A crafted traversing id cannot delete anything above the root. The path
+    // spans segments, so it never matches the run-delete route and the
+    // method guard answers 405, same as the malformed post paths in the
+    // other tests.
+    const escaped = await fetch(`${base}/api/runs/..%2F..%2Ffreya-state`, { method: 'DELETE' });
+    assert.equal(escaped.status, 405);
+    await stat(join(root, 'freya-state', 'protected', 'slots.json'));
+  } finally {
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+});
+
+// Deletion is granted explicitly, never inferred, and stays loopback-only and
+// same-origin like every other authorized write.
+test('delete is disabled without the flag and refused cross-origin', async () => {
+  const root = await fixture();
+  await seedFreyaRun(root);
+  await writeFile(join(root, 'spare.json'), JSON.stringify({ createdAt: 'x', build: {} }));
+
+  const guarded = createUiServer({ root, port: 0, host: '127.0.0.1' });
+  await new Promise<void>((done) => guarded.listen(0, '127.0.0.1', done));
+  const guardedAddress = guarded.address();
+  assert.ok(guardedAddress && typeof guardedAddress === 'object');
+  const guardedBase = `http://127.0.0.1:${guardedAddress.port}`;
+  try {
+    const refused = await fetch(`${guardedBase}/api/runs/live-1`, { method: 'DELETE' });
+    assert.equal(refused.status, 405);
+    await stat(join(root, 'live-1', 'run.json'));
+  } finally {
+    await new Promise<void>((done) => guarded.close(() => done()));
+  }
+
+  // Spare a run for the same-origin refusal check against the enabled server.
+  const spareDir = join(root, 'spare-run');
+  await mkdir(spareDir, { recursive: true });
+  await writeFile(
+    join(spareDir, 'run.json'),
+    JSON.stringify({ kind: 'freya-live-run', status: 'completed' }),
+  );
+
+  const deletable = createUiServer({ root, port: 0, host: '127.0.0.1', allowDelete: true });
+  await new Promise<void>((done) => deletable.listen(0, '127.0.0.1', done));
+  const deletableAddress = deletable.address();
+  assert.ok(deletableAddress && typeof deletableAddress === 'object');
+  try {
+    const crossOrigin = await new Promise<number>((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: '127.0.0.1',
+          port: deletableAddress.port,
+          path: '/api/runs/spare-run',
+          method: 'DELETE',
+          headers: { origin: 'http://evil.example:8080' },
+        },
+        (incoming) => {
+          void incoming.resume();
+          resolve(incoming.statusCode ?? 0);
+        },
+      );
+      outgoing.on('error', reject);
+      outgoing.end();
+    });
+    assert.equal(crossOrigin, 403);
+    await stat(join(root, 'spare-run', 'run.json'));
+  } finally {
+    await new Promise<void>((done) => deletable.close(() => done()));
+  }
 });
 
 test('unknown runs and unrecorded files are refused', async () => {

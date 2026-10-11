@@ -1,5 +1,5 @@
-// Token accounting and cost estimation. Both providers report usage in their
-// own shape, so normalize here and keep the pricing table in one place.
+// Token accounting and cost estimation. Normalize the API usage shape here and
+// keep the pricing table in one place.
 import { object } from './validation.ts';
 
 export type TokenUsage = {
@@ -145,8 +145,8 @@ function count(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
 }
 
-// The first value present, so snake_case provider payloads and the camelCase
-// shape this module writes into run records both read back unchanged.
+// The first value present, so API payloads and the camelCase shape this module
+// writes into run records both read back unchanged.
 function pick(raw: Record<string, unknown>, ...keys: string[]): number {
   for (const key of keys) {
     const value = count(raw[key]);
@@ -158,8 +158,7 @@ function pick(raw: Record<string, unknown>, ...keys: string[]): number {
 }
 
 // OpenAI Responses reports input_tokens inclusive of cached tokens and nests the
-// breakdown under *_tokens_details. The Codex CLI reports cached_input_tokens
-// alongside the same totals. Accept either spelling, and never invent a count.
+// breakdown under *_tokens_details. Never invent a count when usage is absent.
 export function normalizeUsage(raw: unknown): TokenUsage | null {
   if (!object(raw)) {
     return null;
@@ -170,10 +169,7 @@ export function normalizeUsage(raw: unknown): TokenUsage | null {
   const outputDetails = object(raw.output_tokens_details) ? raw.output_tokens_details : {};
   const cached = Math.min(
     input,
-    Math.max(
-      pick(inputDetails, 'cached_tokens'),
-      pick(raw, 'cached_input_tokens', 'cachedInputTokens'),
-    ),
+    Math.max(pick(inputDetails, 'cached_tokens'), pick(raw, 'cachedInputTokens')),
   );
   const written = Math.min(
     Math.max(input - cached, 0),

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { projectRoot } from '../src/experiments.ts';
@@ -59,7 +59,8 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
         assert.equal(url, 'https://api.openai.com/v1/responses');
         const request = JSON.parse(init.body);
         assert.equal(request.stream, true);
-        const task = JSON.parse(request.input).task;
+        const prompt = request.input.flatMap(message => message.content).find(part => part.type === 'input_text').text;
+        const task = JSON.parse(prompt).task;
         assert.equal(task.id, 'brief-a');
         assert.equal('cases' in task, false);
         const blueprint = {
@@ -71,12 +72,13 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
         };
         const text = JSON.stringify({ workflowJson: JSON.stringify(blueprint), uncertainties: [] });
         const events = [
-          {type:'response.created'},
-          {type:'response.output_item.added',item:{type:'reasoning'}},
+          {type:'response.created',response:{id:'resp_test',created_at:1,model:'synthetic-model'}},
+          {type:'response.output_item.added',output_index:0,item:{type:'reasoning',id:'reasoning_1'}},
+          {type:'response.output_item.added',output_index:1,item:{type:'message',id:'message_1',phase:'final_answer'}},
           {type:'response.reasoning_text.delta',delta:'DO_NOT_DISPLAY_PRIVATE_REASONING'},
-          ...(request.reasoning ? [{type:'response.reasoning_summary_text.delta',delta:'Synthetic public summary.'}] : []),
-          {type:'response.output_text.delta',delta:text},
-          {type:'response.completed',response:{status:'completed',usage:{input_tokens:123,output_tokens:456},output:[{type:'message',content:[{type:'output_text',text}]}]}},
+          ...(request.reasoning ? [{type:'response.reasoning_summary_text.delta',item_id:'reasoning_1',output_index:0,summary_index:0,delta:'Synthetic public summary.'}] : []),
+          {type:'response.output_text.delta',item_id:'message_1',output_index:1,delta:text},
+          {type:'response.completed',response:{id:'resp_test',created_at:1,model:'synthetic-model',status:'completed',usage:{input_tokens:123,output_tokens:456},output:[{type:'message',id:'message_1',role:'assistant',content:[{type:'output_text',text,annotations:[]}]}]}},
         ];
         return new Response(events.map(event => 'data: '+JSON.stringify(event)+'\\n\\n').join(''), {headers:{'Content-Type':'text/event-stream'}});
       };
@@ -101,7 +103,6 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     assert.equal(run.status, 0, run.stderr);
     assert.match(run.stderr, /Reading briefs/);
     assert.match(run.stderr, /one direct-generation call/);
-    assert.match(run.stderr, /Responses API accepted/);
     assert.match(run.stderr, /Input tokens: 123; output tokens: 456/);
     // A model absent from the price table still reports tokens, and says so
     // rather than quoting a fabricated cost.
@@ -216,9 +217,10 @@ test('a priced model records a cost alongside its tokens', async () => {
         const text = JSON.stringify({ workflowJson: JSON.stringify(blueprint), uncertainties: [] });
         const usage = {input_tokens:1000000, input_tokens_details:{cached_tokens:500000, cache_write_tokens:200000}, output_tokens:1000000, output_tokens_details:{reasoning_tokens:250000}, total_tokens:2000000};
         const events = [
-          {type:'response.created'},
-          {type:'response.output_text.delta',delta:text},
-          {type:'response.completed',response:{status:'completed',usage,output:[{type:'message',content:[{type:'output_text',text}]}]}},
+          {type:'response.created',response:{id:'resp_test',created_at:1,model:'gpt-5'}},
+          {type:'response.output_item.added',output_index:0,item:{type:'message',id:'message_1',phase:'final_answer'}},
+          {type:'response.output_text.delta',item_id:'message_1',output_index:0,delta:text},
+          {type:'response.completed',response:{id:'resp_test',created_at:1,model:'gpt-5',status:'completed',usage,output:[{type:'message',id:'message_1',role:'assistant',content:[{type:'output_text',text,annotations:[]}]}]}},
         ];
         return new Response(events.map(event => 'data: '+JSON.stringify(event)+'\\n\\n').join(''), {headers:{'Content-Type':'text/event-stream'}});
       };
@@ -288,7 +290,14 @@ test('failed generation retains its request and partial draft in the trace with 
     await writeFile(
       preload,
       `
-      globalThis.fetch = async () => new Response('data: '+JSON.stringify({type:'response.output_text.delta',delta:'synthetic partial draft'})+'\\n\\n', {headers:{'Content-Type':'text/event-stream'}});
+      globalThis.fetch = async () => {
+        const events = [
+          {type:'response.created',response:{id:'resp_test',created_at:1,model:'synthetic-model'}},
+          {type:'response.output_item.added',output_index:0,item:{type:'message',id:'message_1',phase:'final_answer'}},
+          {type:'response.output_text.delta',item_id:'message_1',output_index:0,delta:'synthetic partial draft'},
+        ];
+        return new Response(events.map(event => 'data: '+JSON.stringify(event)+'\\n\\n').join(''), {headers:{'Content-Type':'text/event-stream'}});
+      };
     `,
     );
     const run = spawnSync(
@@ -326,67 +335,6 @@ test('failed generation retains its request and partial draft in the trace with 
       await readFile(join(traceDirectory, 'generation.log'), 'utf8'),
       /synthetic partial draft/,
     );
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('CLI switches to Codex via environment and explicit flags without API or Freya calls', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'builder-codex-cli-test-'));
-  try {
-    const executable = join(directory, 'codex');
-    await writeFile(
-      executable,
-      `#!${process.execPath}
-      (async () => {
-      let input = '';
-      for await (const chunk of process.stdin) input += chunk;
-      if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY || process.env.FREYA_API_KEY) process.exit(2);
-      if (!input.includes('workflowJson')) process.exit(3);
-      if (!process.argv.some(arg => ['model_reasoning_effort="high"', 'model_reasoning_effort="low"'].includes(arg))) process.exit(4);
-      const workflow = { initial_node: 'done', nodes: { done: { name: 'done', node_type: 'end_call', transitions: [] } } };
-      console.log(JSON.stringify({type:'turn.started'}));
-      console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({workflowJson:JSON.stringify(workflow),uncertainties:[]})}}));
-      console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:20}}));
-      })();
-    `,
-    );
-    await chmod(executable, 0o700);
-    for (const args of [[], ['--provider', 'codex', '--reasoning-effort', 'low']]) {
-      const run = spawnSync(
-        process.execPath,
-        ['src/cli.ts', 'freya', '--json-only', '--out', directory, ...args],
-        {
-          cwd: projectRoot,
-          encoding: 'utf8',
-          env: {
-            ...process.env,
-            PATH: directory + ':' + process.env.PATH,
-            BUILDER_PROVIDER: args.length ? 'openai' : 'codex',
-            BUILDER_MODEL: 'synthetic-codex',
-            BUILDER_REASONING_EFFORT: 'high',
-            OPENAI_API_KEY: 'synthetic-api',
-            CODEX_API_KEY: 'synthetic-api',
-            FREYA_API_KEY: 'synthetic-freya',
-          },
-        },
-      );
-      assert.equal(run.status, 0, run.stderr);
-      assert.equal(JSON.parse(run.stdout).initial_node, 'done');
-      assert.match(run.stderr, /Codex started generation/);
-    }
-    const runs = await readdir(join(directory, 'generation'));
-    assert.equal(runs.length, 2);
-    for (const name of runs) {
-      const record = JSON.parse(
-        await readFile(join(directory, 'generation', name, 'run.json'), 'utf8'),
-      );
-      assert.equal(record.config.provider, 'codex');
-      assert.equal(record.calls[0].endpoint, 'codex-exec');
-      assert.ok(['high', 'low'].includes(record.config.reasoningEffort));
-      assert.equal(record.calls[0].request.reasoningEffort, record.config.reasoningEffort);
-      assert.equal(record.evaluation.score, null);
-    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

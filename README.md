@@ -4,20 +4,15 @@ A direct-generation builder for the Build the Builder hackathon. The Freya path 
 
 ## Generate JSON only
 
-Choose either generation provider in `.env` with `BUILDER_PROVIDER=openai` or `BUILDER_PROVIDER=codex`. You can override it for one run:
+Set `OPENAI_API_KEY` and `BUILDER_MODEL` in `.env`. The model can also be supplied for a single run:
 
 ```sh
-pnpm run generate --provider codex --model YOUR_CODEX_MODEL
-pnpm run generate --provider openai --model YOUR_API_MODEL
+pnpm run generate --model YOUR_API_MODEL
 ```
 
-Set thinking effort with `BUILDER_REASONING_EFFORT=high` in `.env`, or override it per run with `pnpm run generate --reasoning-effort high`. This works for `build`, `generate`, and `freya` with either live provider. Leave it blank to use the provider default. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` (Codex only); model/client support varies. API effort is sent as [`reasoning.effort`](https://developers.openai.com/api/docs/guides/reasoning), while Codex uses [`model_reasoning_effort`](https://learn.chatgpt.com/docs/config-file/config-reference). Unsupported settings fail without retries or provider fallback. This is separate from `--reasoning-summary` and is recorded in the run configuration and model request.
+Set reasoning effort with `BUILDER_REASONING_EFFORT=high` in `.env`, or override it per run with `pnpm run generate --reasoning-effort high`. Leave it blank to use the API default. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; model support varies. Effort is sent as [`reasoning.effort`](https://developers.openai.com/api/docs/guides/reasoning). Unsupported settings fail without retries. This is separate from `--reasoning-summary` and is recorded in the run configuration and model request.
 
-For direct API generation through codex-lb, set `OPENAI_BASE_URL=http://127.0.0.1:2455/v1` and put a key created on its `/apis` page in `OPENAI_API_KEY`. The inspector uses the API route automatically; use `--provider openai` in the CLI. The request goes to codex-lb’s Responses-compatible endpoint; credentials stay server-side. Leave `OPENAI_BASE_URL` blank to use OpenAI directly. Runs record the base URL without authorization headers.
-
-For Codex, install the Codex CLI and run `codex login`, selecting ChatGPT, then check `codex login status`. This uses your subscription allowance through [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode), with [ChatGPT authentication](https://learn.chatgpt.com/docs/auth). Keep `OPENAI_API_KEY` in `.env` for switching back; the Codex subprocess excludes API and Freya credentials and uses your configured Codex provider and login, including custom providers such as `codex-lb`. Both paths need an explicitly selected model available to that provider. The API path remains the default for `generate` and `freya`; `build` defaults to the offline mock unless a provider is selected.
-
-Codex receives the same original inputs and output schema in an isolated temporary directory, with read-only execution, shell tools, MCP servers, and web search disabled. Your user config supplies the provider and login; the selected model and reasoning effort come from the run. Temporary files are removed afterward. A run permits one CLI invocation under the existing deadline, records provider/model/usage, and accepts only completed JSON. Codex manages its internal inference token limits and retries; the Responses API's output-token cap does not apply to this path. No paid API fallback is attempted. `--show-draft` displays Codex's completed message before local validation; Codex start, reasoning activity (without private text), and completed messages appear in the trace as CLI events arrive. Workflow text arrives when the CLI message completes; `--reasoning-summary` is supported only on the API path. Subscription exhaustion or login/model errors fail the run.
+For a Responses-compatible endpoint, set its URL in `OPENAI_BASE_URL` and its key in `OPENAI_API_KEY`. Leave the URL blank to use OpenAI directly. Credentials stay server-side, and runs record the base URL without authorization headers. `build` defaults to the offline mock; use `--provider openai` there for a live API call.
 
 Set `OPENAI_API_KEY` and `BUILDER_MODEL` in `.env`, then run:
 
@@ -25,7 +20,7 @@ Set `OPENAI_API_KEY` and `BUILDER_MODEL` in `.env`, then run:
 pnpm run generate
 ```
 
-This generates a phone-agent **workflow JSON** from Brief A, compiles the tool bindings locally, prints the JSON to the terminal, and saves a local diagnostic trace. With the default API provider, it makes one billable OpenAI request; with Codex, it uses subscription allowance. It does not contact Freya, require Freya credentials or Python, or run practice tests. It is locally checked, but has not passed Freya's platform validation or evaluation.
+This generates a phone-agent **workflow JSON** from Brief A, compiles the tool bindings locally, prints the JSON to the terminal, and saves a local diagnostic trace. It makes one billable OpenAI request. It does not contact Freya, require Freya credentials or Python, or run practice tests. It is locally checked, but has not passed Freya's platform validation or evaluation.
 
 To use another brief, pass `--brief-file`. For B, supply both original briefs:
 
@@ -134,7 +129,7 @@ node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \
   --practice-brief B --slot brief-b
 ```
 
-These are live operations. API generation is billable; Codex generation uses subscription allowance. Original brief/tool/platform-documentation inputs are sent to OpenAI. Freya receives the compiled workflow; the official runner creates synthetic bank practice sessions and runs customer/judge simulations on staging. No final competition submission is made.
+These are live operations. Generation is billable. Original brief/tool/platform-documentation inputs are sent to OpenAI. Freya receives the compiled workflow; the official runner creates synthetic bank practice sessions and runs customer/judge simulations on staging. No final competition submission is made.
 
 For a smaller smoke test, add `--only PUB-01` to the A command. For different customer speech, add `--style pieces`, `corrects`, `talkative`, `asks_back`, or `in_words`. `--openapi FILE` selects another original tool API file; `--kit DIRECTORY` selects the event package. `--timeout-ms` can lower the total deadline, but cannot exceed 1,800,000 ms. See `node src/cli.ts --help`.
 
@@ -148,17 +143,17 @@ pnpm run ui
 
 Builds the inspector and opens http://127.0.0.1:4317. `--out DIRECTORY` selects a different record root, `--port` changes the port, and `--kit DIRECTORY` selects the event package used by generation and upload. The script loads `.env` and `build-the-builder/env.sh` when they exist, so the upload action finds `FREYA_API_KEY`. Use `pnpm run ui:dev` for Vite hot reload while working on the UI.
 
-The inspector binds to loopback and serves only artifact names found by its own directory scan. Recorded runs remain read-only. The two authorized writes are starting a generation and uploading a completed workflow; every other route stays GET-only. Both actions reject cross-origin and non-loopback requests, bound their deadlines, and keep credentials server-side.
+The inspector binds to loopback and serves only artifact names found by its own directory scan. Recorded runs remain read-only. Generation, upload, practice testing, deletion, and archive/restore are the authorized writes; artifact routes stay GET-only. Remote actions reject cross-origin and non-loopback requests, bound their deadlines, and keep credentials server-side.
 
-**New run** uses the configured Responses API endpoint and lets you choose a listed or custom model and reasoning effort (or the provider default). It generates Brief A from the selected event package with one model call under the recipe deadline, compiles locally, and opens the recorded run. UI generation needs `OPENAI_API_KEY`; `OPENAI_BASE_URL` selects codex-lb or another compatible endpoint. Only one UI generation can run at a time. Registration and practice testing stay separate.
+**New run** uses the configured Responses API endpoint and lets you choose a listed or custom model and reasoning effort (or the API default). It generates Brief A from the selected event package with one model call under the recipe deadline, compiles locally, and opens the recorded run. UI generation needs `OPENAI_API_KEY`; `OPENAI_BASE_URL` selects OpenAI or another compatible endpoint. Only one UI generation can run at a time. Registration and practice testing stay separate actions.
 
 It discovers all three record shapes together and labels each one:
 
-| Record                                 | Command    | Tabs                                                    |
-| -------------------------------------- | ---------- | ------------------------------------------------------- |
-| `experiments/<uuid>/run.json`          | `freya`    | Overview, Stages, Workflow, Practice, Files             |
-| `experiments/generation/<id>/run.json` | `generate` | Overview, Trace, Candidate, Files + **Upload to Freya** |
-| `experiments/<uuid>.json`              | `build`    | Overview, Candidate, Files                              |
+| Record                                 | Command    | Tabs                                                                                                  |
+| -------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------- |
+| `experiments/<uuid>/run.json`          | `freya`    | Overview, Stages, Workflow, Practice, Files                                                           |
+| `experiments/generation/<id>/run.json` | `generate` | Overview, Trace, Candidate, Files + **Upload to Freya**, **Test & score**, and Practice after testing |
+| `experiments/<uuid>.json`              | `build`    | Overview, Candidate, Files                                                                            |
 
 **All runs** is the default view: every run in one sortable table with its score, status, kind, model, and elapsed time, plus the mean across scored runs. This is the view for comparing runs across tasks before promoting a builder change.
 
@@ -175,7 +170,7 @@ The page polls, so a run that is still in flight updates on its own. While any r
 
 ### Upload a generation to Freya
 
-A completed generation's page carries one action, **Upload to Freya**. It registers that run's `compiled.workflow.json` exactly as compiled, with **no further model call**: workspace verification → platform dry run → create-or-update → export, through the same unchanged organizer bridge a CLI run uses. The event model, tool bindings, and workflow document are untouched. It uploads only; practice testing stays a separate action.
+A completed generation's page carries one action, **Upload to Freya**. It registers that run's `compiled.workflow.json` exactly as compiled, with **no further model call**: workspace verification → platform dry run → create-or-update → export, through the same unchanged organizer bridge a CLI run uses. The event model, tool bindings, and workflow document are untouched. It uploads only; use **Test & score** separately after upload.
 
 Repeats cannot create a second remote agent:
 
@@ -189,13 +184,23 @@ Repeats cannot create a second remote agent:
 
 The result is written to `upload.json` beside the run, with the workflow and agent IDs, so it survives a refresh and appears under **Files**. A failure records which step stopped it. A changed `compiled.workflow.json` is registered into the same slot and published, rather than creating another agent.
 
-The endpoint is `POST /api/runs/<run-id>/upload`. It is the only non-GET route, and it stays inside the inspector's boundaries:
+The endpoint is `POST /api/runs/<run-id>/upload`. It is an authorized non-GET route, and it stays inside the inspector's boundaries:
 
 - **Credentials stay server-side.** `FREYA_API_KEY` and the event package are read from the server process; the browser sends a run id and receives ids. Nothing served contains a key, and platform traces and exports stay redacted.
 - **Only discovered run ids.** The id must resolve through the inspector's own scan, and the workflow is read through that scan's artifact allowlist. A path or traversal is refused.
 - **Loopback and same-origin only.** A non-loopback peer, a cross-site `Sec-Fetch-Site`, or an `Origin` that does not match the `Host` header is refused before any platform call.
 - **A bounded deadline.** One operation budget covers verification, dry run, registration, and export; the lock is always released.
-- **Read-only otherwise.** Artifact and record routes stay GET-only and serve discovered names only.
+- **Read-only artifacts.** Artifact routes stay GET-only and serve discovered names only.
+
+### Test and score an uploaded agent
+
+After **Upload to Freya**, use **Test & score** on the same generation. Choose Brief A, Brief B, or A+B; normal speech or an organizer speaking style; and one or three repetitions. This runs the unchanged kit's `tools/run_cases.py` against the recorded agent id, with no new builder model call and no workflow registration. It creates synthetic practice sessions and Freya simulations, so it uses the platform's simulation resources. Testing needs `FREYA_API_KEY` and a stable `FREYA_BANK_TEAM_KEY` of at least 16 characters in the server environment; restart the inspector after setting them.
+
+The action returns immediately and the inspector polls the recorded status. When testing finishes, the run table and Overview show its public practice score, and Practice shows case verdicts, called tools, call ids, and failure reasons. Three repetitions count a customer only when every repetition passes. These are public practice results, not scores on the hidden final benchmark.
+
+The inspector records `practice-job.json` (status, choices, agent/workflow ids and hash, exact scorer inputs/source versions, start/end, and errors), `practice.json` (latest successful runner results), and `practice-history.json` (all completed attempts and their results). Starting or failing a rerun clears the displayed score; earlier results remain in history. A changed compiled workflow must be uploaded again before testing, and previous scores no longer apply to that workflow.
+
+`POST /api/runs/:id/practice` accepts only brief, style, and repetitions. Credentials and paths stay server-side; ids must be discovered completed, unarchived generations with a matching successful upload. The action rejects cross-origin/non-loopback requests and shares the workspace lock with CLI runs and uploads. Archiving and deleting an active practice run are refused. The default deadline is 25 minutes, including queue time; three slow repetitions may exceed it. A timed-out simulation may still be running remotely: its failure message names the retained workspace lock. Confirm the simulation has stopped before removing that lock and retrying.
 
 ### UI stack
 

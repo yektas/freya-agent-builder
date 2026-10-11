@@ -32,7 +32,6 @@ type Started = {
   kit: string;
   openapi: string;
   briefs: string[];
-  provider: string;
   model: string;
   reasoningEffort?: string;
   timeoutMs: number;
@@ -65,7 +64,7 @@ function fakeGenerate(
         runId: input.runId,
         status: options.fail ? 'failed' : 'completed',
         startedAt: new Date().toISOString(),
-        config: { model: input.model, provider: input.provider, briefs: input.briefs },
+        config: { model: input.model, provider: 'openai', briefs: input.briefs },
         task: { id: 'brief-a', tools: [] },
         calls: [],
         evaluation: { score: null, source: 'not-evaluated' },
@@ -117,17 +116,16 @@ async function harness(
   return { root, base: `http://127.0.0.1:${address.port}`, calls, options };
 }
 
-type Body = { error?: string; run?: { runId: string; provider: string; model: string } };
+type Body = { error?: string; run?: { runId: string; model: string } };
 
 /** Mirrors the shape `GET /api/generate` answers with. */
 type Availability = {
   available: boolean;
   problem: string | null;
-  providers: { id: string; available: boolean; problem: string | null }[];
-  models: { openai: string[]; codex: string[] };
+  models: string[];
   reasoningEfforts: string[];
   timeoutMs: number;
-  running: { runId: string; provider: string; model: string } | null;
+  running: { runId: string; model: string } | null;
 };
 
 async function availability(base: string): Promise<Availability> {
@@ -154,19 +152,12 @@ async function start(
   return { status: response.status, body: (await response.json()) as Body };
 }
 
-test('offers the choices the browser may make and reports provider readiness', async () => {
+test('offers model and reasoning choices and reports API readiness', async () => {
   const h = await harness();
   const offered = await availability(h.base);
   assert.equal(offered.available, true);
   assert.equal(offered.problem, null);
-  // The API provider needs a key; Codex keeps its own ChatGPT login, so this
-  // process cannot judge it and says so by not blocking it.
-  const openai = offered.providers.find((item) => item.id === 'openai');
-  assert.equal(openai?.available, true);
-  assert.deepEqual(offered.models.openai, ['gpt-6.1-sol', 'gpt-6-luna']);
-  assert.deepEqual(offered.models.codex, ['gpt-6.1-sol', 'gpt-6-luna']);
-  // `ultra` is offered, and the dialog filters it for the API path.
-  assert.ok(offered.reasoningEfforts.includes('ultra'));
+  assert.deepEqual(offered.models, ['gpt-6.1-sol', 'gpt-6-luna']);
   // The deadline comes from the recipe and cannot be raised from the browser.
   assert.equal(offered.timeoutMs, 300000);
   assert.equal(offered.running, null);
@@ -174,17 +165,13 @@ test('offers the choices the browser may make and reports provider readiness', a
   assert.equal(JSON.stringify(offered).includes(SECRET), false);
 });
 
-test('an unconfigured API provider is reported without disabling Codex', async () => {
+test('an unconfigured API key disables generation with a clear reason', async () => {
   const h = await harness({ env: { ...process.env, OPENAI_API_KEY: '' } });
   const offered = await generationAvailability(h.options);
-  assert.equal(offered.available, true);
-  const openai = offered.providers.find((item) => item.id === 'openai');
-  assert.equal(openai?.available, false);
-  assert.match(openai?.problem ?? '', /OPENAI_API_KEY/);
-  assert.equal(offered.providers.find((item) => item.id === 'codex')?.available, true);
+  assert.equal(offered.available, false);
+  assert.match(offered.problem ?? '', /OPENAI_API_KEY/);
 
-  // Choosing it anyway is refused with the reason, and no run starts.
-  const refused = await start(h.base, { provider: 'openai', model: 'gpt-6-luna' });
+  const refused = await start(h.base, { model: 'gpt-6-luna' });
   assert.equal(refused.status, 503);
   assert.match(refused.body.error ?? '', /OPENAI_API_KEY/);
   assert.deepEqual(h.calls, []);
@@ -195,10 +182,10 @@ test('normal inspector configuration reads API readiness from the server environ
   process.env.OPENAI_API_KEY = SECRET;
   try {
     const offered = await generationAvailability({ root: await fixture(), kit });
-    assert.equal(offered.providers.find((item) => item.id === 'openai')?.available, true);
+    assert.equal(offered.available, true);
     assert.equal(JSON.stringify(offered).includes(SECRET), false);
     const explicit = await generationAvailability({ root: await fixture(), kit, env: {} });
-    assert.equal(explicit.providers.find((item) => item.id === 'openai')?.available, false);
+    assert.equal(explicit.available, false);
   } finally {
     if (previous === undefined) {
       delete process.env.OPENAI_API_KEY;
@@ -219,15 +206,13 @@ test('a missing event package stops the action before any model call', async () 
   assert.match(offered.problem ?? '', /event package/);
 });
 
-test('starts a generation with the chosen provider, model, and effort', async () => {
+test('starts a generation with the chosen model and effort', async () => {
   const h = await harness();
   const response = await start(h.base, {
-    provider: 'openai',
     model: 'gpt-6.1-sol',
     reasoningEffort: 'high',
   });
   assert.equal(response.status, 202);
-  assert.equal(response.body.run?.provider, 'openai');
   assert.equal(response.body.run?.model, 'gpt-6.1-sol');
   // The run id is addressable before the model call returns.
   assert.ok(response.body.run?.runId);
@@ -235,7 +220,6 @@ test('starts a generation with the chosen provider, model, and effort', async ()
   // The generation runs in this process under the recipe deadline.
   await new Promise((done) => setTimeout(done, 50));
   assert.equal(h.calls.length, 1);
-  assert.equal(h.calls[0].provider, 'openai');
   assert.equal(h.calls[0].model, 'gpt-6.1-sol');
   assert.equal(h.calls[0].reasoningEffort, 'high');
   assert.equal(h.calls[0].timeoutMs, 300000);
@@ -251,66 +235,34 @@ test('starts a generation with the chosen provider, model, and effort', async ()
   assert.equal(runs[0].model, 'gpt-6.1-sol');
 });
 
-test('the Codex provider is selected without an API key', async () => {
-  const h = await harness({ env: { ...process.env, OPENAI_API_KEY: '' } });
-  const response = await start(h.base, { provider: 'codex', model: 'gpt-6.1-sol' });
-  assert.equal(response.status, 202);
-  assert.equal(response.body.run?.provider, 'codex');
-  await new Promise((done) => setTimeout(done, 50));
-  assert.equal(h.calls[0].provider, 'codex');
-  // `ultra` is the one effort reserved for the Codex path.
-  const ultra = await start(h.base, {
-    provider: 'codex',
-    model: 'gpt-6.1-sol',
-    reasoningEffort: 'ultra',
-  });
-  assert.equal(ultra.status, 202);
-  await new Promise((done) => setTimeout(done, 50));
-  assert.equal(h.calls[1].reasoningEffort, 'ultra');
-});
-
-test('omitting the effort uses the provider default', async () => {
+test('omitting the effort uses the API default', async () => {
   const h = await harness();
-  const response = await start(h.base, { provider: 'openai', model: 'gpt-6-luna' });
+  const response = await start(h.base, { model: 'gpt-6-luna' });
   assert.equal(response.status, 202);
   await new Promise((done) => setTimeout(done, 50));
   // No effort is sent at all, exactly as the CLI does when none is given.
   assert.equal(h.calls[0].reasoningEffort, undefined);
 });
 
-test('refuses unknown providers, models, and efforts without calling a model', async () => {
+test('refuses invalid models and efforts without calling a model', async () => {
   const h = await harness();
-  const provider = await start(h.base, { provider: 'anthropic', model: 'gpt-6-luna' });
-  assert.equal(provider.status, 422);
-  assert.match(provider.body.error ?? '', /provider must be openai or codex/);
-
-  const model = await start(h.base, { provider: 'openai', model: '   ' });
+  const model = await start(h.base, { model: '   ' });
   assert.equal(model.status, 422);
   assert.match(model.body.error ?? '', /Choose a model/);
 
-  const long = await start(h.base, { provider: 'openai', model: 'x'.repeat(200) });
+  const long = await start(h.base, { model: 'x'.repeat(200) });
   assert.equal(long.status, 422);
 
   const effort = await start(h.base, {
-    provider: 'openai',
     model: 'gpt-6-luna',
     reasoningEffort: 'extreme',
   });
   assert.equal(effort.status, 422);
   assert.match(effort.body.error ?? '', /reasoning-effort must be one of/);
 
-  // `ultra` is refused on the API path with the same rule the CLI enforces.
-  const ultra = await start(h.base, {
-    provider: 'openai',
-    model: 'gpt-6-luna',
-    reasoningEffort: 'ultra',
-  });
-  assert.equal(ultra.status, 422);
-  assert.match(ultra.body.error ?? '', /only by the codex provider/);
-
-  // A custom model outside the offered list is still accepted: the provider is
-  // the authority on what it can run.
-  const custom = await start(h.base, { provider: 'openai', model: 'gpt-6-luna-2026-01-01' });
+  // A custom model outside the offered list is still accepted; the API decides
+  // which models are available.
+  const custom = await start(h.base, { model: 'gpt-6-luna-2026-01-01' });
   assert.equal(custom.status, 202);
   await new Promise((done) => setTimeout(done, 50));
   assert.equal(h.calls.length, 1);
@@ -323,10 +275,10 @@ test('one generation at a time: a second request names the run already running',
     release = done;
   });
   const h = await harness({ delay: gate });
-  const first = await start(h.base, { provider: 'openai', model: 'gpt-6-luna' });
+  const first = await start(h.base, { model: 'gpt-6-luna' });
   assert.equal(first.status, 202);
 
-  const second = await start(h.base, { provider: 'codex', model: 'gpt-6.1-sol' });
+  const second = await start(h.base, { model: 'gpt-6.1-sol' });
   assert.equal(second.status, 409);
   assert.match(second.body.error ?? '', /still running/);
   assert.match(second.body.error ?? '', /gpt-6-luna/);
@@ -337,7 +289,7 @@ test('one generation at a time: a second request names the run already running',
   assert.equal(h.calls.length, 1);
 
   // Once it finishes, the next one is accepted.
-  const third = await start(h.base, { provider: 'openai', model: 'gpt-6-luna' });
+  const third = await start(h.base, { model: 'gpt-6-luna' });
   assert.equal(third.status, 202);
   await new Promise((done) => setTimeout(done, 50));
   assert.equal(h.calls.length, 2);
@@ -345,7 +297,7 @@ test('one generation at a time: a second request names the run already running',
 
 test('a failed generation is recorded on its own run, not as a route error', async () => {
   const h = await harness({ generate: fakeGenerate([], { fail: true }) });
-  const response = await start(h.base, { provider: 'openai', model: 'gpt-6-luna' });
+  const response = await start(h.base, { model: 'gpt-6-luna' });
   // The run started, so the browser navigates to it and reads the failure there.
   assert.equal(response.status, 202);
   await new Promise((done) => setTimeout(done, 50));
@@ -370,24 +322,20 @@ test('a cross-origin or cross-site request is refused before any model call', as
   const h = await harness();
   const cross = await start(
     h.base,
-    { provider: 'openai', model: 'gpt-6-luna' },
+    { model: 'gpt-6-luna' },
     { headers: { origin: 'https://attacker.example' } },
   );
   assert.equal(cross.status, 403);
   const fetched = await start(
     h.base,
-    { provider: 'openai', model: 'gpt-6-luna' },
+    { model: 'gpt-6-luna' },
     { headers: { 'sec-fetch-site': 'cross-site' } },
   );
   assert.equal(fetched.status, 403);
   assert.deepEqual(h.calls, []);
 
   // The same-origin click that follows still works.
-  const accepted = await start(
-    h.base,
-    { provider: 'openai', model: 'gpt-6-luna' },
-    { headers: { origin: h.base } },
-  );
+  const accepted = await start(h.base, { model: 'gpt-6-luna' }, { headers: { origin: h.base } });
   assert.equal(accepted.status, 202);
 });
 
@@ -407,7 +355,7 @@ test('an inspector started without generation configuration refuses to start a r
   const response = await fetch(`${base}/api/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider: 'openai', model: 'gpt-6-luna' }),
+    body: JSON.stringify({ model: 'gpt-6-luna' }),
   });
   assert.equal(response.status, 503);
   assert.deepEqual(await listRuns(root), []);
@@ -425,7 +373,7 @@ test('recorded runs stay read-only: generation is the only new write', async () 
 
 test('the started run carries no credential in its record', async () => {
   const h = await harness();
-  const response = await start(h.base, { provider: 'openai', model: 'gpt-6-luna' });
+  const response = await start(h.base, { model: 'gpt-6-luna' });
   assert.equal(response.status, 202);
   await new Promise((done) => setTimeout(done, 50));
   const record = await readFile(
@@ -447,12 +395,9 @@ test('startGeneration validates before reserving the single run slot', async () 
     env: { ...process.env, OPENAI_API_KEY: SECRET },
     generate: fakeGenerate(calls),
   };
-  await assert.rejects(
-    () => startGeneration(options, { provider: 'nope', model: 'gpt-6-luna' }),
-    /provider must be openai or codex/,
-  );
+  await assert.rejects(() => startGeneration(options, { model: '   ' }), /Choose a model/);
   // A refused request leaves no run and no trace behind.
   assert.deepEqual(await listRuns(root), []);
-  const started = await startGeneration(options, { provider: 'openai', model: 'gpt-6-luna' });
+  const started = await startGeneration(options, { model: 'gpt-6-luna' });
   assert.ok(started.runId);
 });

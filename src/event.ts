@@ -9,20 +9,17 @@ import {
   parseWorkflowCandidate,
   workflowCandidateSchema,
 } from './workflow.ts';
-import { createLiveGenerator } from './codex.ts';
-import type { LiveProvider } from './codex.ts';
 import { FreyaBridge } from './freya.ts';
 import type { PracticeResult, Registration } from './freya.ts';
 import { hash, sourceSnapshot } from './experiments.ts';
 import { object } from './validation.ts';
 import { generationProgress } from './progress.ts';
-import type { ModelEvent, ReasoningEffort } from './providers.ts';
-import type { CallRecord } from './providers.ts';
+import { createOpenAIGenerator } from './providers.ts';
+import type { CallRecord, ModelEvent, ReasoningEffort } from './providers.ts';
 import { createGenerationTrace } from './generation-trace.ts';
 import { estimateCost, hasUsage, sumUsage } from './usage.ts';
 
-// Totals a generator's recorded calls so a run reports one comparable figure
-// regardless of which provider produced the calls.
+// Totals a generator's recorded calls so a run reports one comparable figure.
 function usageOf(calls: CallRecord[], model: string) {
   const tokens = sumUsage(calls.map((call) => call.usage));
   return hasUsage(tokens) ? { tokens, cost: estimateCost(tokens, model) } : null;
@@ -39,13 +36,11 @@ export type EventOptions = {
   style?: string;
   timeoutMs: number;
   model: string;
-  provider?: LiveProvider;
   reasoningEffort?: ReasoningEffort;
 };
 
 function workflowGenerator(
   model: string,
-  provider: LiveProvider = 'openai',
   transport: typeof fetch = fetch,
   observation: {
     onEvent?: (event: ModelEvent) => void;
@@ -54,8 +49,7 @@ function workflowGenerator(
     reasoningEffort?: ReasoningEffort;
   } = {},
 ) {
-  return createLiveGenerator(
-    provider,
+  return createOpenAIGenerator(
     model,
     {
       instructions: freyaRecipe.instructions,
@@ -68,16 +62,15 @@ function workflowGenerator(
   );
 }
 
-// Generation-only path: no Freya credentials or practice inputs. Codex uses a local subprocess.
+// Generation-only path: no Freya credentials or practice inputs.
 export async function generateFreyaJson(
   options: Pick<
     EventOptions,
-    'briefs' | 'openapi' | 'kit' | 'model' | 'timeoutMs' | 'provider' | 'reasoningEffort'
+    'briefs' | 'openapi' | 'kit' | 'model' | 'timeoutMs' | 'reasoningEffort'
   > & {
     quiet?: boolean;
     showDraft?: boolean;
     reasoningSummary?: boolean;
-    reasoningEffort?: ReasoningEffort;
     out?: string;
     /**
      * Caller-chosen run id, so a run started from the inspector is addressable
@@ -90,6 +83,7 @@ export async function generateFreyaJson(
     options.out || 'experiments',
     {
       ...options,
+      provider: 'openai',
       limits: freyaRecipe.limits,
     },
     options.runId,
@@ -102,11 +96,7 @@ export async function generateFreyaJson(
   try {
     progress.report(`Trace directory: ${trace.directory}`);
     trace.update({ source: await sourceSnapshot() });
-    const provider = options.provider || 'openai';
-    createLiveGenerator(provider, options.model);
-    if (provider === 'codex' && options.reasoningSummary) {
-      throw new Error('--reasoning-summary is supported only by the openai provider.');
-    }
+    const provider = 'openai';
     if (
       !Number.isInteger(options.timeoutMs) ||
       options.timeoutMs < 1 ||
@@ -128,11 +118,11 @@ export async function generateFreyaJson(
     progress.report(
       `Strategy: one direct-generation call to ${options.model}; no planning, audit, or repair calls.`,
     );
-    progress.report(`Reasoning effort: ${options.reasoningEffort || 'provider default'}.`);
+    progress.report(`Reasoning effort: ${options.reasoningEffort || 'API default'}.`);
     progress.report(
-      `Limits: ${provider === 'codex' ? 'one Codex invocation (CLI manages token limits)' : `${freyaRecipe.limits.maxOutputTokens} output tokens`}; ${Math.min(options.timeoutMs, freyaRecipe.limits.generationTimeoutMs) / 1000}s deadline.`,
+      `Limits: ${freyaRecipe.limits.maxOutputTokens} output tokens; ${Math.min(options.timeoutMs, freyaRecipe.limits.generationTimeoutMs) / 1000}s deadline.`,
     );
-    const generator = workflowGenerator(options.model, provider, fetch, {
+    const generator = workflowGenerator(options.model, fetch, {
       onEvent: (event) => {
         trace.model(event);
         progress.model(event);
@@ -209,8 +199,7 @@ export async function generateFreyaJson(
 export async function runFreya(
   options: EventOptions,
 ): Promise<{ status: string; path: string; error?: string }> {
-  const provider = options.provider || 'openai';
-  createLiveGenerator(provider, options.model);
+  const provider = 'openai';
   if (
     !process.env.FREYA_API_KEY?.trim() ||
     !process.env.FREYA_BANK_TEAM_KEY ||
@@ -276,7 +265,7 @@ export async function runFreya(
   ]) {
     kitFiles[name] = await readFile(join(kit, name), 'utf8');
   }
-  const generator = workflowGenerator(options.model, provider, fetch, {
+  const generator = workflowGenerator(options.model, fetch, {
     reasoningEffort: options.reasoningEffort,
   });
   const record: Record<string, any> = {

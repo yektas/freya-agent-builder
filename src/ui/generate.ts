@@ -1,6 +1,6 @@
 // Starting a generation is the inspector's second authorized write. It runs the
-// same `generateFreyaJson` a CLI `generate` runs, with the provider, model, and
-// reasoning effort chosen in the browser. Everything the browser sends is a
+// same `generateFreyaJson` a CLI `generate` runs, with the model and reasoning
+// effort chosen in the browser. Everything the browser sends is a
 // choice, not a capability: it may not name a path, a key, or a package outside
 // the event kit, and every credential stays in this process.
 //
@@ -11,8 +11,6 @@
 import { stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { newGenerationRunId } from '../generation-trace.ts';
-import { liveProvider } from '../codex.ts';
-import type { LiveProvider } from '../codex.ts';
 import { generateFreyaJson } from '../event.ts';
 import { reasoningEfforts, parseReasoningEffort } from '../providers.ts';
 import type { ReasoningEffort } from '../providers.ts';
@@ -24,7 +22,6 @@ import { freyaRecipe } from '../recipe.ts';
  * practice testing stays out of the inspector entirely.
  */
 export type GenerationRequest = {
-  provider?: unknown;
   model?: unknown;
   reasoningEffort?: unknown;
 };
@@ -37,11 +34,8 @@ export type GenerationOptions = {
   kit: string;
   openapi?: string;
   env?: NodeJS.ProcessEnv;
-  /**
-   * Model ids offered per provider. A model outside these lists is still
-   * accepted; these are shortcuts to the ones this repository documents.
-   */
-  models?: Partial<Record<LiveProvider, string[]>>;
+  /** A model outside this list is still accepted; the API decides what it can run. */
+  models?: string[];
   /** Runs the generation. Tests inject a transport so no model is called. */
   generate?: GenerateRunner;
 };
@@ -52,7 +46,6 @@ export type GenerateRunner = (options: {
   kit: string;
   openapi: string;
   briefs: string[];
-  provider: LiveProvider;
   model: string;
   reasoningEffort?: ReasoningEffort;
   timeoutMs: number;
@@ -71,29 +64,20 @@ export class GenerateError extends Error {
 export type GenerationAvailability = {
   available: boolean;
   problem: string | null;
-  /** Per-provider readiness, so one unusable path does not disable the other. */
-  providers: { id: LiveProvider; available: boolean; problem: string | null }[];
-  models: Record<LiveProvider, string[]>;
+  models: string[];
   reasoningEfforts: ReasoningEffort[];
   /** Bounded by the recipe; the browser cannot raise it. */
   timeoutMs: number;
   /** The run already in flight, if any. One generation at a time. */
-  running: { runId: string; provider: LiveProvider; model: string } | null;
+  running: { runId: string; model: string } | null;
 };
 
-// Models this repository documents for each path. Not an allowlist: a custom id
-// is still accepted, because the provider is the authority on what it can run.
-const API_MODELS = ['gpt-6.1-sol', 'gpt-6-luna'];
-const CODEX_MODELS = ['gpt-6.1-sol', 'gpt-6-luna'];
-
-export const defaultModels: Record<LiveProvider, string[]> = {
-  openai: API_MODELS,
-  codex: CODEX_MODELS,
-};
+// These are suggestions, not an allowlist; the API decides which models are available.
+export const defaultModels = ['gpt-6.1-sol', 'gpt-6-luna'];
 
 // One generation at a time: a second click would double the spend and interleave
 // two runs in one inspector. The running run is reported instead of refused.
-let running: { runId: string; provider: LiveProvider; model: string } | null = null;
+let running: { runId: string; model: string } | null = null;
 
 const runGeneration: GenerateRunner = (options) =>
   generateFreyaJson({
@@ -102,7 +86,6 @@ const runGeneration: GenerateRunner = (options) =>
     kit: options.kit,
     out: options.out,
     runId: options.runId,
-    provider: options.provider,
     model: options.model,
     reasoningEffort: options.reasoningEffort,
     timeoutMs: options.timeoutMs,
@@ -141,32 +124,11 @@ export async function generationAvailability(
 ): Promise<GenerationAvailability> {
   const kit = resolve(options.kit);
   const env = options.env ?? process.env;
-  const providers: GenerationAvailability['providers'] = [];
-  for (const id of ['openai', 'codex'] as LiveProvider[]) {
-    if (id === 'openai') {
-      // The key is read here and never sent; only its presence is reported.
-      providers.push({
-        id,
-        available: !!env.OPENAI_API_KEY?.trim(),
-        problem: env.OPENAI_API_KEY?.trim()
-          ? null
-          : 'Set OPENAI_API_KEY before generating through the API provider.',
-      });
-      continue;
-    }
-    providers.push({
-      id,
-      // The Codex CLI keeps its own ChatGPT login; nothing in this process says
-      // whether it is usable, so the run reports the real answer.
-      available: true,
-      problem: null,
-    });
-  }
-  const models: Record<LiveProvider, string[]> = {
-    openai: options.models?.openai ?? defaultModels.openai,
-    codex: options.models?.codex ?? defaultModels.codex,
-  };
   const missing: string[] = [];
+  // Only key presence is reported; credentials never leave the server.
+  if (!env.OPENAI_API_KEY?.trim()) {
+    missing.push('Set OPENAI_API_KEY before generating.');
+  }
   if (!(await exists(join(kit, 'freya.py')))) {
     missing.push(`No event package at ${kit}. Pass --kit DIRECTORY.`);
   }
@@ -180,8 +142,7 @@ export async function generationAvailability(
   return {
     available: missing.length === 0,
     problem: missing.length ? missing.join(' ') : null,
-    providers,
-    models,
+    models: options.models ?? defaultModels,
     reasoningEfforts: [...reasoningEfforts],
     timeoutMs: freyaRecipe.limits.generationTimeoutMs,
     running: running && { ...running },
@@ -189,7 +150,7 @@ export async function generationAvailability(
 }
 
 /**
- * Validates the browser's three choices and starts one generation. Returns as
+ * Validates the browser's model and effort choices and starts one generation. Returns as
  * soon as the run is recorded and addressable, so the inspector can navigate to
  * it and watch the trace stream in; the model call continues in this process.
  */
@@ -198,7 +159,6 @@ export async function startGeneration(
   request: GenerationRequest,
 ): Promise<{
   runId: string;
-  provider: LiveProvider;
   model: string;
   reasoningEffort?: ReasoningEffort;
 }> {
@@ -211,24 +171,17 @@ export async function startGeneration(
   if (running) {
     throw new GenerateError(
       409,
-      `Generation ${running.runId} is still running (${running.provider} / ${running.model}). Wait for it to finish before starting another.`,
+      `Generation ${running.runId} is still running (${running.model}). Wait for it to finish before starting another.`,
     );
   }
 
-  let provider: LiveProvider;
-  try {
-    provider = liveProvider(String(request.provider ?? 'openai'));
-  } catch (error) {
-    throw new GenerateError(422, message(error));
-  }
-  const readiness = availability.providers.find((item) => item.id === provider)!;
-  if (!readiness.available) {
-    throw new GenerateError(503, readiness.problem!);
+  if (Object.keys(request).some((key) => key !== 'model' && key !== 'reasoningEffort')) {
+    throw new GenerateError(422, 'Generation accepts only model and reasoningEffort.');
   }
 
   const model = String(request.model ?? '').trim();
   if (!model) {
-    throw new GenerateError(422, 'Choose a model; the provider is asked for one explicitly.');
+    throw new GenerateError(422, 'Choose a model; it is sent explicitly to the API.');
   }
   if (model.length > 120 || /[\r\n]/.test(model)) {
     throw new GenerateError(422, 'Model name is too long or contains a line break.');
@@ -244,12 +197,8 @@ export async function startGeneration(
   } catch (error) {
     throw new GenerateError(422, message(error));
   }
-  if (provider === 'openai' && reasoningEffort === 'ultra') {
-    throw new GenerateError(422, 'reasoning-effort ultra is supported only by the codex provider.');
-  }
-
   const runId = newGenerationRunId();
-  const started = { runId, provider, model };
+  const started = { runId, model };
   running = started;
   const briefs = [await defaultBrief(kit)];
   // The run's own trace records the failure if generation throws, so the browser
@@ -262,7 +211,6 @@ export async function startGeneration(
         kit,
         openapi,
         briefs,
-        provider,
         model,
         ...(reasoningEffort ? { reasoningEffort } : {}),
         timeoutMs: freyaRecipe.limits.generationTimeoutMs,

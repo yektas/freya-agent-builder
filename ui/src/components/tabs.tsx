@@ -195,7 +195,7 @@ export function WorkflowTab({
 
   return (
     <div>
-      <Section title={`Graph · ${w.source} · ${w.nodes.length} nodes`}>
+      <Section title={`Graph · ${w.nodes.length} nodes`}>
         <div className="mb-2.5 flex flex-wrap items-center gap-4 text-[11px] text-muted-foreground">
           {Object.entries(TYPE_COLOR).map(([type, cls]) => (
             <span key={type} className="flex items-center gap-1.5">

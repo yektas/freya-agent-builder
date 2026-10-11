@@ -24,8 +24,9 @@ import {
 import type { GenerationAvailability, StartedRun } from '@/lib/data';
 import { cn } from '@/lib/utils';
 
-/** The escape hatch: any model id the provider accepts, listed or not. */
+/** The escape hatch: any model id the API accepts, listed or not. */
 const CUSTOM = '__custom__';
+const API_DEFAULT = '__api_default__';
 
 /**
  * New run starts one generation with the choices made here. It only sends those
@@ -42,7 +43,7 @@ export function NewRunAction({
   const [open, setOpen] = React.useState(false);
   const [options, setOptions] = React.useState<GenerationAvailability | null>(null);
   const [model, setModel] = React.useState('');
-  const [effort, setEffort] = React.useState<string>('provider');
+  const [effort, setEffort] = React.useState<string>(API_DEFAULT);
   const [custom, setCustom] = React.useState('');
   const [pending, setPending] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -58,8 +59,7 @@ export function NewRunAction({
       setOptions({
         available: false,
         problem: 'Inspector unreachable.',
-        providers: [],
-        models: { openai: [], codex: [] },
+        models: [],
         reasoningEfforts: [],
         timeoutMs: 0,
         running: null,
@@ -74,24 +74,22 @@ export function NewRunAction({
     return () => window.clearInterval(timer);
   }, [open, load]);
 
-  const models = options?.models.openai ?? [];
+  const models = options?.models ?? [];
   const selected = model === CUSTOM || models.includes(model) ? model : '';
-  const providerState = options?.providers.find((item) => item.id === 'openai');
   const running = options?.running ?? null;
-  const efforts = (options?.reasoningEfforts ?? []).filter((value) => value !== 'ultra');
+  const efforts = options?.reasoningEfforts ?? [];
 
   // Use the first offered model when no model has been selected.
   React.useEffect(() => {
     if (!options) return;
-    if (selected === CUSTOM || options.models.openai.includes(selected)) return;
-    const first = options.models.openai[0] ?? '';
+    if (selected === CUSTOM || options.models.includes(selected)) return;
+    const first = options.models[0] ?? '';
     setModel(first);
     setCustom('');
   }, [options, selected]);
 
   const modelName = selected === CUSTOM ? custom.trim() : selected;
-  const blocked =
-    !options?.available || !providerState?.available || !!running || !modelName || pending;
+  const blocked = !options?.available || !!running || !modelName || pending;
 
   const start = async () => {
     setPending(true);
@@ -101,11 +99,9 @@ export function NewRunAction({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          provider: 'openai',
           model: modelName,
-          // 'provider' means the provider's own default, which is what the CLI
-          // does when no effort is given.
-          ...(effort !== 'provider' ? { reasoningEffort: effort } : {}),
+          // Omit the effort to use the API's default, as the CLI does.
+          ...(effort !== API_DEFAULT ? { reasoningEffort: effort } : {}),
         }),
       });
       const body = (await response.json().catch(() => ({}))) as {
@@ -194,11 +190,11 @@ export function NewRunAction({
             <Label htmlFor="effort">Reasoning effort</Label>
             <Select value={effort} onValueChange={(value) => value && setEffort(value)}>
               <SelectTrigger id="effort" className="w-full">
-                <SelectValue>{effort === 'provider' ? 'Provider default' : effort}</SelectValue>
+                <SelectValue>{effort === API_DEFAULT ? 'API default' : effort}</SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value="provider">Provider default</SelectItem>
+                  <SelectItem value={API_DEFAULT}>API default</SelectItem>
                   {efforts.map((name) => (
                     <SelectItem key={name} value={name}>
                       {name}
@@ -218,18 +214,13 @@ export function NewRunAction({
           {running && (
             <p className="border-l-2 border-warning py-0.5 pl-3 text-[11px] leading-relaxed text-muted-foreground">
               <Terminal className="mr-1 inline size-3 align-[-2px]" />
-              {running.runId} is still running ({running.provider} / {running.model}). Wait for it
-              to finish before starting another.
+              {running.runId} is still running ({running.model}). Wait for it to finish before
+              starting another.
             </p>
           )}
           {!options?.available && options?.problem && (
             <p className="border-l-2 border-warning py-0.5 pl-3 text-[11px] leading-relaxed text-muted-foreground">
               {options.problem}
-            </p>
-          )}
-          {providerState && !providerState.available && (
-            <p className="border-l-2 border-warning py-0.5 pl-3 text-[11px] leading-relaxed text-muted-foreground">
-              {providerState.problem}
             </p>
           )}
           {error && (

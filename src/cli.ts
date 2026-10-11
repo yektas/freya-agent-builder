@@ -4,8 +4,7 @@ import { resolve } from 'node:path';
 import { build, defaultOptions } from './builder.ts';
 import { LocalAdapter } from './adapter.ts';
 import { candidateSchema, parseTask } from './validation.ts';
-import { MockGenerator, parseReasoningEffort } from './providers.ts';
-import { createLiveGenerator, liveProvider } from './codex.ts';
+import { createOpenAIGenerator, MockGenerator, parseReasoningEffort } from './providers.ts';
 import { hash, saveRun, sourceSnapshot } from './experiments.ts';
 import { recipe } from './recipe.ts';
 import { freyaRecipe } from './recipe.ts';
@@ -18,14 +17,14 @@ const help = `Freya builder
 pnpm run generate            print Brief A workflow JSON and save a local trace; no Freya calls
 pnpm run generate --brief-file FILE   use another brief (repeat for additive briefs)
 
-pnpm run ui                  browse recorded runs, start a generation, or upload a finished workflow
+pnpm run ui                  browse, archive/restore runs, start a generation, or upload
 
 node src/cli.ts build --task fixtures/reschedule.json
 node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \\
   --brief-file build-the-builder/briefs/brief-a.md --practice-brief A --slot brief-a
 
 Freya options (live generation, registration, official practice, export):
-  --json-only                 print locally compiled workflow JSON and stop; openai or codex
+  --json-only                 print locally compiled workflow JSON and stop
   --quiet                     hide generation progress (JSON-only mode)
   --show-draft                stream unvalidated model JSON to stderr (JSON-only mode)
   --reasoning-summary         request model-provided summaries if supported (JSON-only mode)
@@ -39,9 +38,9 @@ Freya options (live generation, registration, official practice, export):
   --timeout-ms 1800000         total Freya run deadline (30 minutes maximum)
 
 Options:
-  --provider mock|openai|codex or BUILDER_PROVIDER; build defaults to mock, freya to openai
-  --model MODEL               or BUILDER_MODEL; required for openai or codex
-  --reasoning-effort LEVEL     or BUILDER_REASONING_EFFORT; unset uses provider default
+  --provider mock|openai or BUILDER_PROVIDER; build only, defaults to mock
+  --model MODEL               or BUILDER_MODEL; required for live generation
+  --reasoning-effort LEVEL     or BUILDER_REASONING_EFFORT; unset uses the API default
   --timeout-ms ${recipe.limits.timeoutMs}         total build deadline, up to 1800000 ms
   --out experiments           append-only run records with source snapshots
 
@@ -50,6 +49,8 @@ Inspector options (ui command):
   --port 4317                 HTTP port on the loopback interface
   --host 127.0.0.1            bind address; loopback only by default
   --kit DIRECTORY             event package used by the upload action
+  --allow-delete              allow the inspector to permanently delete recorded runs
+  --allow-archive             allow the inspector to archive runs; restoring is included
 
 Upload from the inspector (ui command):
   A completed generation's compiled.workflow.json can be registered on Freya
@@ -85,6 +86,8 @@ async function main() {
       quiet: { type: 'boolean' },
       'show-draft': { type: 'boolean' },
       'reasoning-summary': { type: 'boolean' },
+      'allow-delete': { type: 'boolean' },
+      'allow-archive': { type: 'boolean' },
       port: { type: 'string', default: '4317' },
       host: { type: 'string', default: '127.0.0.1' },
     },
@@ -101,15 +104,21 @@ async function main() {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error('ui port must be an integer from 1 to 65535.');
     }
-    // The inspector only reads recorded files, except for the two authorized
+    // The inspector only reads recorded files, except for the authorized
     // actions. Upload registers an already compiled workflow on Freya and
     // generation starts one new local run; both ask for discovered ids or
     // plain choices, never for a path or a key, and credentials stay here.
+    // Deleting a recorded run is granted explicitly because it is
+    // irreversible: the flag exists so no accidental click can remove a
+    // benchmark artifact.
     startUi({
       root: resolve(values.out!),
       port,
       host: values.host!,
+      allowDelete: values['allow-delete'] === true,
+      allowArchive: values['allow-archive'] === true,
       upload: { root: resolve(values.out!), kit: resolve(values.kit!) },
+      practice: { root: resolve(values.out!), kit: resolve(values.kit!) },
       generation: {
         root: resolve(values.out!),
         kit: resolve(values.kit!),
@@ -122,13 +131,14 @@ async function main() {
     values['reasoning-effort'] ?? process.env.BUILDER_REASONING_EFFORT,
   );
   if (positionals[0] === 'freya') {
-    const provider = liveProvider(values.provider || process.env.BUILDER_PROVIDER || 'openai');
+    if (values.provider && values.provider !== 'openai') {
+      throw new Error('The freya command uses the OpenAI Responses API; provider must be openai.');
+    }
     if (values['json-only']) {
       const workflow = await generateFreyaJson({
         briefs: values['brief-file'] || [resolve(values.kit!, 'briefs/brief-a.md')],
         openapi: values.openapi || resolve(values.kit!, 'tools/openapi.json'),
         kit: values.kit!,
-        provider,
         reasoningEffort,
         model: values.model || process.env.BUILDER_MODEL || '',
         timeoutMs: Number(
@@ -164,7 +174,6 @@ async function main() {
           ? values['timeout-ms']
           : freyaRecipe.limits.timeoutMs,
       ),
-      provider,
       reasoningEffort,
       model: values.model || process.env.BUILDER_MODEL || '',
     });
@@ -182,10 +191,13 @@ async function main() {
   }
   const provider = values.provider || process.env.BUILDER_PROVIDER || 'mock';
   const model = values.model || process.env.BUILDER_MODEL || '';
+  if (provider !== 'mock' && provider !== 'openai') {
+    throw new Error('build provider must be mock or openai.');
+  }
   const generator =
     provider === 'mock'
       ? new MockGenerator()
-      : createLiveGenerator(liveProvider(provider), model, {
+      : createOpenAIGenerator(model, {
           instructions: recipe.instructions,
           schema: candidateSchema,
           ...recipe.limits,

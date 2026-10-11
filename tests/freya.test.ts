@@ -121,6 +121,18 @@ urllib.request.urlopen = urlopen
     });
     assert.equal(practice.passed, 1); // synthetic server verdict; not an official benchmark score
     assert.equal(practice.total, 1);
+    const repeated = await call('practice', {
+      agentId: 'synthetic-agent',
+      casesPath: join(kit, 'public-test-set.json'),
+      cacheDir: join(directory, 'practice-cache'),
+      path: join(directory, 'practice-three.json'),
+      only: caseFixture.id,
+      repetitions: 3,
+    });
+    assert.equal(repeated.runs, 3);
+    assert.equal(repeated.passed, 1);
+    assert.equal(repeated.final[0].passes, 3);
+    assert.equal(repeated.all_rows.length, 3);
     const log = await readFile(trace, 'utf8');
     assert.equal(log.includes('synthetic-secret'), false);
     assert.equal(log.includes('synthetic-team-secret'), false);

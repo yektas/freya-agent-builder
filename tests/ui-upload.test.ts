@@ -137,15 +137,14 @@ async function harness(
       await writeFile(join(dir, 'compiled.workflow.json'), compiled(node));
     }
   }
-  const env: NodeJS.ProcessEnv =
-    options.uploadEnv ??
-    ({
-      ...process.env,
-      PYTHONPATH: transport,
-      SYNTHETIC_TRANSPORT_ROOT: transport,
-      FREYA_API_KEY: SECRET,
-      FREYA_WORKSPACE_ID: 'synthetic-workspace',
-    } as NodeJS.ProcessEnv);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONPATH: transport,
+    SYNTHETIC_TRANSPORT_ROOT: transport,
+    FREYA_API_KEY: SECRET,
+    FREYA_WORKSPACE_ID: 'synthetic-workspace',
+    ...options.uploadEnv,
+  } as NodeJS.ProcessEnv;
   const server = createUiServer({
     root,
     port: 0,
@@ -467,6 +466,56 @@ test('a platform that never answers is stopped by the operation deadline', async
   await assert.rejects(() =>
     readFile(join(h.root, 'freya-state', 'synthetic-workspace', 'workspace.lock'), 'utf8'),
   );
+});
+
+test('the console link answers the api origin, or a configured workflow template', async () => {
+  // No FREYA_API_URL in the injected env: no link can exist, rather than one
+  // pointing at the default production host.
+  const bare = await harness({
+    uploadEnv: {
+      ...process.env,
+      FREYA_API_KEY: SECRET,
+      FREYA_WORKSPACE_ID: 'synthetic-workspace',
+      FREYA_API_URL: '',
+      FREYA_WORKFLOW_URL: '',
+    },
+  });
+  const empty = await (await fetch(`${bare.base}/api/upload`)).json();
+  assert.deepEqual(empty.consoleUrl, null);
+  assert.equal(empty.exact, false);
+
+  // The dashboard origin is the honest fallback when no deep route is known.
+  const origin = await harness({
+    uploadEnv: {
+      ...process.env,
+      FREYA_API_KEY: SECRET,
+      FREYA_WORKSPACE_ID: 'synthetic-workspace',
+      FREYA_API_URL: 'https://staging-app.freyavoice.ai',
+      FREYA_WORKFLOW_URL: '',
+    },
+  });
+  const fallback = await (await fetch(`${origin.base}/api/upload`)).json();
+  assert.equal(fallback.consoleUrl, 'https://staging-app.freyavoice.ai');
+  assert.equal(fallback.exact, false);
+
+  // A configured template is marked exact, so the UI substitutes run ids into
+  // it client-side. The template itself carries no ids and no secret.
+  const templated = await harness({
+    uploadEnv: {
+      ...process.env,
+      FREYA_API_KEY: SECRET,
+      FREYA_WORKSPACE_ID: 'synthetic-workspace',
+      FREYA_API_URL: 'https://staging-app.freyavoice.ai',
+      FREYA_WORKFLOW_URL: 'https://staging-app.freyavoice.ai/workflows/{workflowId}',
+    },
+  });
+  const exact = await (await fetch(`${templated.base}/api/upload`)).json();
+  assert.equal(exact.consoleUrl, 'https://staging-app.freyavoice.ai/workflows/{workflowId}');
+  assert.equal(exact.exact, true);
+  // Registering still works with a template configured.
+  const uploaded = await post(templated.base, 'generation~gen-accept');
+  assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
+  assert.equal(uploaded.body.upload?.workflowId, 'synthetic-workflow');
 });
 
 test('recorded runs stay read-only: only the upload route accepts a write', async () => {
