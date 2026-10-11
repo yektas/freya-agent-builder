@@ -13,6 +13,8 @@ import { estimateCost, hasUsage, sumUsage } from './usage.ts';
 import { startUi } from './ui/server.ts';
 import { prepareSubmission, finalizeSubmission } from './submission.ts';
 import { compareRuns } from './comparison.ts';
+import { recoverPractice } from './practice-recovery.ts';
+import { parseFreyaStrategy } from './strategies.ts';
 
 const help = `Freya builder
 
@@ -28,12 +30,15 @@ node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \\
 Freya options (live generation, registration, official practice, export):
   --final                     register and export; no public practice (requires --openapi)
   --repetitions 1|3           practice repetitions; default 1
+  --strategy direct|precise-routing|validated-dates|runtime-contract|case-folder   default direct (measured best); others stay selectable
   --json-only                 print locally compiled workflow JSON and stop
   --quiet                     hide generation progress (JSON-only mode)
   --show-draft                stream unvalidated model JSON to stderr (JSON-only mode)
   --reasoning-summary         request model-provided summaries if supported (JSON-only mode)
   --brief-file FILE           repeat for additive briefs (A + B)
+  --case-folder DIRECTORY     ingest the supplied source documents as one case
   --openapi FILE              default: build-the-builder/tools/openapi.json
+  --mock-url URL              bind original tool paths to this HTTPS mock base URL
   --kit DIRECTORY             default: build-the-builder
   --slot NAME                 stable slot; later runs update and publish it
   --practice-brief A|B         filter official cases; omitted runs all cases
@@ -42,9 +47,12 @@ Freya options (live generation, registration, official practice, export):
   --timeout-ms 1800000         total Freya run deadline (30 minutes maximum)
 
 Offline commands:
-  submission --run-file FILE --run-file FILE --out submission --team NAME --repo URL --commit SHA
+  submission --run-file FILE --out submission --team NAME --member-json '{"name":"...","email":"..."}' --repo URL --commit SHA --mock-url URL --run-command COMMAND
   submission --finalize --out submission --commit SHA
   compare --run-file FILE [--run-file FILE ...]
+
+Recover a timed-out test (GET requests only; no new simulation):
+  recover-practice --run-id GENERATION_ID [--out experiments] [--kit DIRECTORY]
 
 Options:
   --provider mock|openai or BUILDER_PROVIDER; build only, defaults to mock
@@ -85,6 +93,7 @@ async function main() {
       'reasoning-effort': { type: 'string' },
       'timeout-ms': { type: 'string', default: String(defaultOptions.timeoutMs) },
       'brief-file': { type: 'string', multiple: true },
+      'case-folder': { type: 'string' },
       openapi: { type: 'string' },
       kit: { type: 'string', default: 'build-the-builder' },
       slot: { type: 'string' },
@@ -95,10 +104,15 @@ async function main() {
       final: { type: 'boolean' },
       finalize: { type: 'boolean' },
       repetitions: { type: 'string' },
+      strategy: { type: 'string' },
       'run-file': { type: 'string', multiple: true },
+      'run-id': { type: 'string' },
       team: { type: 'string' },
+      'member-json': { type: 'string', multiple: true },
       repo: { type: 'string' },
       commit: { type: 'string' },
+      'mock-url': { type: 'string' },
+      'run-command': { type: 'string' },
       quiet: { type: 'boolean' },
       'show-draft': { type: 'boolean' },
       'reasoning-summary': { type: 'boolean' },
@@ -114,9 +128,28 @@ async function main() {
   }
   if (
     positionals.length !== 1 ||
-    !['build', 'freya', 'ui', 'submission', 'compare'].includes(positionals[0])
+    !['build', 'freya', 'ui', 'submission', 'compare', 'recover-practice'].includes(positionals[0])
   ) {
-    throw new Error('Supply build, freya, ui, submission, or compare. Use --help.');
+    throw new Error(
+      'Supply build, freya, ui, submission, compare, or recover-practice. Use --help.',
+    );
+  }
+  if (values.strategy !== undefined && positionals[0] !== 'freya') {
+    throw new Error('--strategy is supported only by the freya command.');
+  }
+  if (positionals[0] === 'recover-practice') {
+    const job = await recoverPractice(
+      { root: values.out!, kit: values.kit! },
+      values['run-id'] ?? '',
+    );
+    console.log(
+      JSON.stringify(
+        { id: job.id, status: job.status, passed: job.passed, total: job.total },
+        null,
+        2,
+      ),
+    );
+    return;
   }
   if (positionals[0] === 'submission') {
     if (values.finalize) {
@@ -138,8 +171,11 @@ async function main() {
           runs: values['run-file'] ?? [],
           out: values.out === 'experiments' ? 'submission' : values.out!,
           team: values.team ?? '',
+          members: (values['member-json'] ?? []).map((entry) => JSON.parse(entry)),
           repo: values.repo ?? '',
           commit: values.commit ?? '',
+          mockUrl: values['mock-url'] ?? '',
+          runCommand: values['run-command'] ?? '',
         }),
         null,
         2,
@@ -183,12 +219,14 @@ async function main() {
     values['reasoning-effort'] ?? process.env.BUILDER_REASONING_EFFORT,
   );
   if (positionals[0] === 'freya') {
+    const strategy = parseFreyaStrategy(values.strategy);
     if (values.provider && values.provider !== 'openai') {
       throw new Error('The freya command uses the OpenAI Responses API; provider must be openai.');
     }
     if (
       values.final &&
       (!values.openapi ||
+        !values['mock-url'] ||
         values['json-only'] ||
         values['practice-brief'] ||
         values.only ||
@@ -196,15 +234,20 @@ async function main() {
         values.repetitions)
     ) {
       throw new Error(
-        '--final requires --openapi and does not accept JSON-only or practice settings.',
+        '--final requires --openapi and --mock-url; it does not accept JSON-only or practice settings.',
       );
     }
     if (values['json-only']) {
       const workflow = await generateFreyaJson({
-        briefs: values['brief-file'] || [resolve(values.kit!, 'briefs/brief-a.md')],
+        briefs:
+          values['brief-file'] ||
+          (values['case-folder'] ? [] : [resolve(values.kit!, 'briefs/brief-a.md')]),
+        caseFolder: values['case-folder'],
         openapi: values.openapi || resolve(values.kit!, 'tools/openapi.json'),
+        mockUrl: values['mock-url'],
         kit: values.kit!,
         reasoningEffort,
+        strategy,
         model: values.model || process.env.BUILDER_MODEL || '',
         timeoutMs: Number(
           process.argv.includes('--timeout-ms') ||
@@ -221,12 +264,16 @@ async function main() {
       return;
     }
     const briefs = values['brief-file'] || [];
-    if (!briefs.length || !values.slot) {
-      throw new Error('freya requires --brief-file FILE and --slot NAME.');
+    if ((!briefs.length && !values['case-folder']) || !values.slot) {
+      throw new Error(
+        'freya requires --brief-file FILE or --case-folder DIRECTORY, and --slot NAME.',
+      );
     }
     const result = await runFreya({
       briefs,
+      caseFolder: values['case-folder'],
       openapi: values.openapi || resolve(values.kit!, 'tools/openapi.json'),
+      mockUrl: values['mock-url'],
       kit: values.kit!,
       slot: values.slot,
       out: values.out!,
@@ -242,6 +289,7 @@ async function main() {
           : freyaRecipe.limits.timeoutMs,
       ),
       reasoningEffort,
+      strategy,
       model: values.model || process.env.BUILDER_MODEL || '',
     });
     console.log(JSON.stringify(result));

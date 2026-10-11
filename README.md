@@ -63,8 +63,9 @@ pnpm --silent run generate --quiet > workflow.json
 
 Every generation creates a unique directory under `experiments/generation/` and prints its absolute path to stderr. It contains:
 
-- `generation.log`: readable progress, streamed drafts, available model summaries, and errors.
-- `trace.jsonl`: timestamped events appended as they arrive, including partial output if generation fails or is interrupted.
+- `generation.log`: concise progress, usage, compilation results, and errors; heartbeats every 30 seconds.
+- `trace.jsonl`: timestamped milestones, compact call metadata, and stream counts; full payloads stay in `run.json`.
+- `model-draft.txt` / `model-summary.txt`: redacted streamed text, saved incrementally when returned, including partial output on failure.
 - `run.json`: original inputs, configuration, source snapshot, model request/response, timings, token usage when returned, raw candidate, compiled workflow, and failure details.
 
 Drafts are saved even without `--show-draft`; `--quiet` only suppresses terminal progress. To request model summaries and choose a different log root:
@@ -80,11 +81,68 @@ Credentials, auth headers, encrypted reasoning, and raw private reasoning are ex
 Start with **[src/recipe.ts](src/recipe.ts)**. `freyaRecipe` controls the actual event builder:
 
 - `instructions`: what the builder model reads, follows, and produces.
-- `limits`: one model call, 24,000 output tokens (including reasoning), a five-minute generation deadline, and a 30-minute total deadline including practice tests. JSON-only generation defaults to the recipe's generation deadline; `--timeout-ms` can shorten it.
+- `limits`: one model call, 24,000 output tokens (including reasoning), a ten-minute generation deadline, and a 30-minute total deadline including practice tests. JSON-only generation defaults to the recipe's generation deadline; `--timeout-ms` can shorten it.
 - `generate`: generate → compile locally. Used by the JSON-only command.
 - `run`: use `generate`, then platform dry run → register → export → practice.
 
 Choose the builder model through `BUILDER_MODEL` or `--model`. The generated phone agent uses the event model from the original `freya.py`; this integration does not change it. Export happens before practice so a failed or timed-out test preserves the selected workflow.
+
+`--strategy direct` is the default for CLI and inspector generations. It is the
+measured best of the three: recorded practice scored direct 6, 1 and 4 of 10 against
+runtime-contract 3, 0 and 0. Both contract variants remain selectable for comparison.
+The experimental `validated-dates` strategy in `src/strategies.ts` adds instructions to
+validate a proposed payment date in code before agreement, confirmation, and a
+promise write. Calendar rules still come from the original brief. Corrections must
+repeat validation and confirmation. This candidate uses the same one-call budget:
+
+```sh
+node --env-file-if-exists=.env src/cli.ts freya --json-only --strategy validated-dates
+```
+
+This command makes a paid model call when credentials are configured. The inspector's
+New Generation action uses the default strategy; upload and practice are separate
+actions. Run records and comparison reports show the strategy and instructions hash.
+Submission preparation requires matching strategies and hashes and pins the strategy
+in the reproduction command. Legacy direct records retain a null instructions hash.
+The candidate has passed offline wiring checks only; it is not promoted until matched
+practice evaluation, repetitions, styles, and a second fresh build support it. See
+`docs/plans/2026-10-11-validated-dates-experiment.md` for the evaluation criteria.
+
+The experimental `--strategy precise-routing` keeps direct generation as the baseline
+while asking for separate contact, verification, and final stages with short,
+specific intent routes. Generation logs node, transition, per-node intent, and custom
+routing-prompt counts for review without imposing a fixed graph-size ceiling. Its first live candidate
+reached verification but scored 0/10 after expanding to 59 nodes and 142 transitions.
+A second candidate scored 2/10 with 38 nodes and 98 transitions; its account router
+missed explicit paid and restructuring exits. A third scored 6/10 with 49 nodes and
+149 transitions, matching the best recorded direct score in one repetition. The
+current guidance separates answer collection, authoritative tool calls, and result
+routing; it remains untested. Generation does not register or practice-test a workflow
+on its own. See `docs/plans/2026-10-11-precise-routing-experiment.md`.
+
+The experimental `--strategy runtime-contract` gives every bank tool a compiler-owned
+`builder_result_<tool>` JSON snapshot, preserving nested arrays and objects. It adds
+instructions for source-derived result state and prerequisite gates, and rejects
+literal Python reads of flattened/mapped responses, automatic nodes without an
+always fallback, and normal nodes without an explicit path to termination. These
+are static mechanics checks, not a policy proof or benchmark score. It keeps the
+one-call budget and is not the default, because the recorded practice above measured
+worse than direct. See `docs/plans/2026-10-11-runtime-contract-experiment.md` for
+limits and evaluation.
+
+Collection nodes reset extracted observations before each entry and route through an
+explicit decision node. Success acknowledgements declare a source-derived
+`success_guard`; the compiler checks transport and application success before entry.
+These mechanics aim to prevent retained observations and unchecked acknowledgement
+paths. The v9 live test exposed rejected resets for constrained fields and malformed
+serialized observations. A follow-up run then deadlocked on every case: the compiler
+had attached a long custom `extraction_prompt` to each of 71 staged fields, and the
+platform runs one extraction call per turn for a node's whole schema, so the node was
+reached and then produced no extraction, routing or dialogue event at all. The
+compiler no longer injects those prompts, and it now rejects an extraction schema
+wider than 12 fields or 5000 bytes at compile time. Both contract strategies remain
+opt-in until a matched evaluation beats direct. See
+`docs/plans/2026-10-11-current-turn-contract-experiment.md` for the matched evaluation.
 
 The model produces graph structure, prompts, transitions, optional Python code, and tool **references**. It never generates tool schemas. The compiler translates those references at the verified event boundary using the supplied OpenAPI. Business rules come from the input briefs, not compiler constants. No automatic repair is included yet.
 
@@ -281,20 +339,24 @@ For the event contract, start with the [research index](docs/hackathon-research-
 
 ## Final runs and submission
 
-Before final runs, verify the current organizer package and updates. Install the supplied
-kit at `build-the-builder/`. Commit the builder changes first so its source snapshot is
-clean. Do not write hidden brief rules into builder code or edit generated workflows.
+The [current Submit tab](https://www.freyavoice.ai/hackathon#submit) describes **one**
+final case. At 17:00 UTC (20:00 Istanbul) on October 11, download its zip and read
+`BRIEF.md` and `README.md`. It includes the service contract and six example
+conversations. Build a mock of those services on Cloudflare Workers and keep it
+reachable until results are announced. Run the builder on the case folder and the
+mock URL. The phone agent's tools must point only to that mock. The final agent
+speaks Turkish; the practice cases remain English and use the organizer-hosted bank.
 
-For each hidden brief, provide its own API file:
-
-```sh
-node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya --final \
-  --brief-file briefs/hidden-1.md --openapi briefs/hidden-1.openapi.json --slot hidden-1
-```
-
-`--final` generates, compiles, validates, registers, and exports in one bounded run.
-It does not read public cases or start practice. Its evaluation remains `null`.
-Final mode rejects practice settings. Keep the run path printed by the command.
+The released package is staged locally at
+`/Users/sercanyektas/Downloads/build-the-builder/final-case`. Recheck the Drive
+folder and organizer mail before the final run because further source files may
+arrive. `scripts/run-final-case.sh {case_folder} {mock_url}` derives a tool catalog
+from the supplied service contract, ingests the case folder, binds tool URLs to the
+mock, registers the workflow, and exports it. The deployed mock is
+`https://freyabank-statement-mock.yektas.workers.dev`. Commit builder changes before
+the selected run so its source snapshot is clean. Never put final-case rules into
+builder code or edit the generated workflow by hand. A selected run must finish
+within 30 minutes; final mode does not start a practice simulation.
 
 For development practice, use `--repetitions 3` with the full Freya CLI. The inspector
 also supports three repetitions. Both paths now require matching original brief and
@@ -305,22 +367,40 @@ If CLI practice times out, it retains the workspace lock and reports its path. V
 that the remote simulation has stopped before removing the lock. An ordinary completed
 practice releases the lock. Do not start another simulation while its state is uncertain.
 
-After choosing two completed final runs, prepare their exact exports and traces:
+For a timed-out inspector test, retrieve the existing result without starting another
+simulation:
+
+```sh
+node --env-file-if-exists=.env --env-file-if-exists=build-the-builder/env.sh \
+  src/cli.ts recover-practice --run-id 'generation~RUN-ID'
+```
+
+Recovery uses GET requests and the original scorer. It verifies the recorded inputs,
+package, registration, simulation identities, and lock owner. It preserves the timeout
+in practice history and releases the retained lock only after valid results are saved.
+It refuses incomplete repetitions and missing or inconclusive judge verdicts. The
+default retrieval deadline is three minutes; it does not change the original test budget.
+Practice execution also refuses a score when a completed simulation summary has
+incomplete detailed verdicts. A dashboard pass count alone is not a bank-and-policy score.
+
+After choosing one completed final run, prepare its exact export and trace:
 
 ```sh
 node src/cli.ts submission \
-  --run-file experiments/RUN-1/run.json --run-file experiments/RUN-2/run.json \
+  --run-file experiments/RUN/run.json \
   --team TEAM --repo https://github.com/OWNER/REPO --commit BUILDER_COMMIT \
+  --member-json '{"name":"NAME","email":"EMAIL"}' \
+  --mock-url https://YOUR-MOCK.workers.dev \
+  --run-command 'YOUR_VERIFIED_COMMAND {case_folder} {mock_url}' \
   --out submission
 ```
 
-The first run becomes hidden-1, and the second becomes hidden-2. The command validates
-the clean run source against the builder commit, export hashes, registration IDs, and
-trace fields. It refuses existing output and credential material. Both runs must use
-the same model and reasoning settings. The form initially has `commit: null`.
+Repeat `--member-json` for a teammate. The command validates the clean run source
+against the builder commit, export hash, registration IDs, and trace fields. It
+refuses existing output and credential material. The form initially has `commit: null`.
 
-Commit the two `submission/hidden-*.workflow.json` exports and the two
-`submission/hidden-*.trace.json` traces. Leave experiment directories and credentials
+Commit `submission/final.workflow.json` and `submission/final.trace.json`. Leave
+experiment directories and credentials
 out of Git. Then finalize against the commit that contains those files:
 
 ```sh

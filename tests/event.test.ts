@@ -105,7 +105,13 @@ test('final run exports without reading public cases or testing the new brief', 
     const hidden = join(root, 'synthetic-raw.md');
     await writeFile(hidden, 'Synthetic bank mail: use a different outcome table.');
     const result = await runFreya(
-      { ...h.options, briefs: [hidden], final: true, brief: undefined },
+      {
+        ...h.options,
+        briefs: [hidden],
+        final: true,
+        brief: undefined,
+        mockUrl: 'https://synthetic-bank.workers.dev',
+      },
       h.dependencies,
     );
     assert.equal(result.status, 'completed');
@@ -114,6 +120,14 @@ test('final run exports without reading public cases or testing the new brief', 
     assert.equal(record.evaluation.score, null);
     assert.equal('public-test-set.json' in record.kit.files, false);
     assert.ok(record.exportHash);
+    assert.equal(
+      record.task.tools[0].url,
+      'https://freya-bank-mock.freyavoice.workers.dev/v1/verify_identity',
+    );
+    assert.equal(
+      record.task.openapi.document.servers[0].url,
+      'https://freya-bank-mock.freyavoice.workers.dev/v1',
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

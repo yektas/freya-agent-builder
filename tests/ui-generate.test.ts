@@ -28,6 +28,7 @@ after(async () => {
 
 type Started = {
   runId: string;
+  runName: string;
   out: string;
   kit: string;
   openapi: string;
@@ -64,8 +65,17 @@ function fakeGenerate(
         runId: input.runId,
         status: options.fail ? 'failed' : 'completed',
         startedAt: new Date().toISOString(),
-        config: { model: input.model, provider: 'openai', briefs: input.briefs },
-        task: { id: 'brief-a', tools: [] },
+        config: {
+          model: input.model,
+          provider: 'openai',
+          briefs: input.briefs,
+          runName: input.runName,
+        },
+        task: {
+          id: 'brief-a',
+          tools: [],
+          briefs: [{ text: '# Brief A: Freya Bank, early-stage collections, one product' }],
+        },
         calls: [],
         evaluation: { score: null, source: 'not-evaluated' },
       }),
@@ -116,7 +126,7 @@ async function harness(
   return { root, base: `http://127.0.0.1:${address.port}`, calls, options };
 }
 
-type Body = { error?: string; run?: { runId: string; model: string } };
+type Body = { error?: string; run?: { runId: string; runName: string; model: string } };
 
 /** Mirrors the shape `GET /api/generate` answers with. */
 type Availability = {
@@ -159,7 +169,7 @@ test('offers model and reasoning choices and reports API readiness', async () =>
   assert.equal(offered.problem, null);
   assert.deepEqual(offered.models, ['gpt-6.1-sol', 'gpt-6-luna']);
   // The deadline comes from the recipe and cannot be raised from the browser.
-  assert.equal(offered.timeoutMs, 300000);
+  assert.equal(offered.timeoutMs, 600000);
   assert.equal(offered.running, null);
   // No credential reaches the browser.
   assert.equal(JSON.stringify(offered).includes(SECRET), false);
@@ -222,7 +232,7 @@ test('starts a generation with the chosen model and effort', async () => {
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].model, 'gpt-6.1-sol');
   assert.equal(h.calls[0].reasoningEffort, 'high');
-  assert.equal(h.calls[0].timeoutMs, 300000);
+  assert.equal(h.calls[0].timeoutMs, 600000);
   // Briefs come from the kit, never from the browser.
   assert.deepEqual(h.calls[0].briefs, [join(kit, 'briefs', 'brief-a.md')]);
   assert.equal(h.calls[0].out, resolve(h.root));
@@ -233,6 +243,21 @@ test('starts a generation with the chosen model and effort', async () => {
   assert.equal(runs[0].kind, 'generation-only');
   assert.equal(runs[0].id, `generation~${response.body.run!.runId}`);
   assert.equal(runs[0].model, 'gpt-6.1-sol');
+  assert.equal(runs[0].name, 'v1');
+  assert.equal(runs[0].title, 'v1');
+  assert.equal(runs[0].briefName, 'Brief A: Freya Bank, early-stage collections, one product');
+
+  const second = await start(h.base, { model: 'gpt-6-luna' });
+  assert.equal(second.status, 202);
+  assert.equal(second.body.run?.runName, 'v2');
+  await new Promise((done) => setTimeout(done, 50));
+  assert.deepEqual(
+    (await listRuns(h.root))
+      .filter((run) => run.kind === 'generation-only')
+      .map((run) => run.name)
+      .sort(),
+    ['v1', 'v2'],
+  );
 });
 
 test('omitting the effort uses the API default', async () => {

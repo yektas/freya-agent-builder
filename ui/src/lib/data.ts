@@ -5,6 +5,8 @@ export type Evaluation = {
   total: number | null;
   source: string;
   details: string | null;
+  conversationPassed?: number | null;
+  conversationTotal?: number | null;
 };
 
 export type RunFile = { name: string; bytes: number };
@@ -47,6 +49,8 @@ export function defaultFile(files: RunFile[]): string | null {
 export type RunSummary = {
   id: string;
   kind: 'freya-live-run' | 'generation-only' | 'local-build';
+  name: string | null;
+  briefName: string | null;
   title: string;
   status: string;
   startedAt: string | null;
@@ -119,6 +123,7 @@ export type Practice = {
   iterationId: string | null;
   cases: PracticeCase[];
   summaryOnly: boolean;
+  conversationPassed: number | null;
 };
 
 export type Stage = {
@@ -161,10 +166,12 @@ export type Upload = {
   status: 'registered' | 'failed' | 'uncertain';
   /** Step the operation reached, so a failure names what stopped. */
   stage: string;
+  workflowName: string | null;
   slot: string;
   workspaceId: string | null;
   workflowId: string | null;
   agentId: string | null;
+  workflowUrl: string | null;
   version: number | null;
   workflowHash: string | null;
   exportedPath: string | null;
@@ -184,7 +191,7 @@ export type GenerationAvailability = {
   reasoningEfforts: ReasoningEffort[];
   timeoutMs: number;
   /** The generation already in flight, if any. */
-  running: { runId: string; model: string } | null;
+  running: { runId: string; runName?: string; model: string } | null;
 };
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -192,6 +199,7 @@ export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | '
 /** The run a New run request started, from `POST /api/generate`. */
 export type StartedRun = {
   runId: string;
+  runName: string;
   model: string;
   reasoningEffort?: ReasoningEffort;
 };

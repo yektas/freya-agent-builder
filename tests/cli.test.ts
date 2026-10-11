@@ -4,8 +4,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { projectRoot } from '../src/experiments.ts';
-import { recipe } from '../src/recipe.ts';
+import { hash, projectRoot } from '../src/experiments.ts';
+import { freyaRecipe, recipe } from '../src/recipe.ts';
+import { freyaStrategyInstructions, parseFreyaStrategy } from '../src/strategies.ts';
+import { loadFreyaTask } from '../src/workflow.ts';
 
 test('CLI build creates reproducible records with null benchmark scores', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'freya-test-'));
@@ -86,7 +88,17 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     );
     const run = spawnSync(
       process.execPath,
-      ['--import', preload, 'src/cli.ts', 'freya', '--json-only', '--out', directory],
+      [
+        '--import',
+        preload,
+        'src/cli.ts',
+        'freya',
+        '--json-only',
+        '--strategy',
+        'direct',
+        '--out',
+        directory,
+      ],
       {
         cwd: projectRoot,
         encoding: 'utf8',
@@ -108,7 +120,10 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     // rather than quoting a fabricated cost.
     assert.match(run.stderr, /Total usage: 123 input tokens, 456 output tokens/);
     assert.match(run.stderr, /cost unavailable: no published price for this model/);
-    assert.match(run.stderr, /Node talk: conversation; tools: verify_identity; routes: done/);
+    assert.match(
+      run.stderr,
+      /Compiled 2 nodes, 1 transition; maximum 0 intent routes in one node; 0 custom routing prompts; initial node: talk/,
+    );
     assert.equal(run.stderr.includes('DO_NOT_DISPLAY_PRIVATE_REASONING'), false);
     const workflow = JSON.parse(run.stdout);
     assert.equal(workflow.initial_node, 'talk');
@@ -126,7 +141,10 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     assert.equal(record.evaluation.score, null);
     assert.equal(record.calls[0].request.model, 'synthetic-model');
     assert.equal(record.calls[0].request.max_output_tokens, 24000);
-    assert.equal(record.config.timeoutMs, 300000);
+    assert.equal(record.config.timeoutMs, 600000);
+    assert.equal(record.config.strategy, 'direct');
+    assert.equal(record.calls[0].request.instructions, freyaRecipe.instructions);
+    assert.equal(record.config.instructionsHash, hash(freyaRecipe.instructions));
     assert.equal('headers' in record.calls[0], false);
     assert.deepEqual(record.usage.tokens, {
       inputTokens: 123,
@@ -146,12 +164,24 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     assert.equal(events.includes('synthetic-model-key'), false);
     assert.equal(events.includes('DO_NOT_DISPLAY_PRIVATE_REASONING'), false);
     const log = await readFile(join(traceDirectory, 'generation.log'), 'utf8');
-    assert.match(log, /Node talk/);
-    assert.match(log, /model draft/);
+    assert.match(log, /Compiled/);
+    assert.equal(log.includes('[model draft]'), false);
+    assert.ok((await readFile(join(traceDirectory, 'model-draft.txt'), 'utf8')).length > 0);
     assert.match(run.stderr, /Trace directory:/);
     const quiet = spawnSync(
       process.execPath,
-      ['--import', preload, 'src/cli.ts', 'freya', '--json-only', '--quiet', '--out', directory],
+      [
+        '--import',
+        preload,
+        'src/cli.ts',
+        'freya',
+        '--json-only',
+        '--strategy',
+        'direct',
+        '--quiet',
+        '--out',
+        directory,
+      ],
       {
         cwd: projectRoot,
         encoding: 'utf8',
@@ -174,6 +204,8 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
         'freya',
         '--json-only',
         '--show-draft',
+        '--strategy',
+        'direct',
         '--reasoning-summary',
         '--out',
         directory,
@@ -193,7 +225,138 @@ test('JSON-only command prints a compiled workflow and saves a redacted trace wi
     assert.match(detailed.stderr, /model draft.*not yet validated/);
     assert.equal(detailed.stderr.includes('DO_NOT_DISPLAY_PRIVATE_REASONING'), false);
     assert.deepEqual(JSON.parse(detailed.stdout), workflow);
-    assert.equal((await readdir(runsRoot)).length, 3);
+    const candidate = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        preload,
+        'src/cli.ts',
+        'freya',
+        '--json-only',
+        '--strategy',
+        'validated-dates',
+        '--out',
+        directory,
+      ],
+      {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: 'synthetic-model-key',
+          BUILDER_MODEL: 'synthetic-model',
+          FREYA_API_KEY: '',
+          FREYA_BANK_TEAM_KEY: '',
+          PYTHON: '/nonexistent-python',
+        },
+      },
+    );
+    assert.equal(candidate.status, 0, candidate.stderr);
+    assert.deepEqual(JSON.parse(candidate.stdout), workflow);
+    const contractRun = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        preload,
+        'src/cli.ts',
+        'freya',
+        '--json-only',
+        '--out',
+        directory,
+        '--strategy',
+        'runtime-contract',
+      ],
+      {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: 'synthetic-model-key',
+          BUILDER_MODEL: 'synthetic-model',
+          FREYA_API_KEY: '',
+          PYTHON: '/nonexistent-python',
+        },
+      },
+    );
+    assert.equal(contractRun.status, 0, contractRun.stderr);
+    assert.match(
+      JSON.parse(contractRun.stdout).nodes.talk.tools[0].post_process_code,
+      /builder_result_verify_identity/,
+    );
+    const records = await Promise.all(
+      (await readdir(runsRoot)).map(async (id) =>
+        JSON.parse(await readFile(join(runsRoot, id, 'run.json'), 'utf8')),
+      ),
+    );
+    assert.equal(records.length, 5);
+    const contractRecord = records.find((item) => item.config.strategy === 'runtime-contract');
+    assert.equal(contractRecord.calls.length, 1);
+    assert.equal(
+      contractRecord.config.instructionsHash,
+      hash(freyaStrategyInstructions('runtime-contract')),
+    );
+    assert.equal(
+      contractRecord.calls[0].request.instructions,
+      freyaStrategyInstructions('runtime-contract'),
+    );
+    assert.equal(contractRecord.inputHash, record.inputHash);
+    const candidateRecord = records.find((item) => item.config.strategy === 'validated-dates');
+    const candidateInstructions = freyaStrategyInstructions('validated-dates');
+    assert.notEqual(candidateInstructions, freyaRecipe.instructions);
+    assert.equal(candidateInstructions.startsWith(freyaRecipe.instructions), true);
+    assert.equal(candidateRecord.calls[0].request.instructions, candidateInstructions);
+    assert.equal(candidateRecord.config.instructionsHash, hash(candidateInstructions));
+    assert.deepEqual(
+      candidateRecord.task,
+      await loadFreyaTask(
+        ['build-the-builder/briefs/brief-a.md'],
+        'build-the-builder/tools/openapi.json',
+        'build-the-builder',
+      ),
+    );
+    assert.equal(candidateRecord.inputHash, record.inputHash);
+    assert.equal(candidateRecord.calls.length, 1);
+    assert.equal(candidateRecord.config.limits.maxCalls, 1);
+    assert.equal(candidateRecord.calls[0].request.max_output_tokens, 24000);
+    assert.equal(candidateRecord.config.timeoutMs, 600000);
+    assert.equal(candidateRecord.evaluation.score, null);
+    assert.ok(candidateRecord.source.files['src/strategies.ts']);
+    // Recorded practice on 2026-10-11: direct 6/10, 1/10, 4/10; runtime-contract
+    // 3/10, 0/10, 0/10. The default follows the measured result, not the newest idea.
+    assert.equal(parseFreyaStrategy(undefined), 'direct');
+    assert.equal(freyaStrategyInstructions('direct'), freyaRecipe.instructions);
+    assert.equal(parseFreyaStrategy('precise-routing'), 'precise-routing');
+    assert.match(freyaStrategyInstructions('precise-routing'), /Routing-precision experiment/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('unknown or misplaced strategy is rejected before network or output records', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'freya-strategy-test-'));
+  try {
+    const preload = join(directory, 'no-network.mjs');
+    await writeFile(
+      preload,
+      `globalThis.fetch = () => { throw new Error('NETWORK_NOT_ALLOWED'); };`,
+    );
+    for (const args of [
+      ['freya', '--json-only', '--strategy', 'unknown'],
+      ['build', '--task', 'fixtures/reschedule.json', '--strategy', 'validated-dates'],
+    ]) {
+      const run = spawnSync(
+        process.execPath,
+        ['--import', preload, 'src/cli.ts', ...args, '--out', directory],
+        {
+          cwd: projectRoot,
+          encoding: 'utf8',
+        },
+      );
+      assert.equal(run.status, 1);
+      assert.match(run.stderr, /Choose builder strategy|supported only by the freya/);
+      assert.equal(run.stderr.includes('NETWORK_NOT_ALLOWED'), false);
+      assert.deepEqual(await readdir(directory), ['no-network.mjs']);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -328,11 +491,11 @@ test('failed generation retains its request and partial draft in the trace with 
     assert.equal(record.calls.length, 1);
     assert.match(record.calls[0].error, /ended before/);
     const events = await readFile(join(traceDirectory, 'trace.jsonl'), 'utf8');
-    assert.match(events, /synthetic partial draft/);
+    assert.equal(events.includes('synthetic partial draft'), false);
     assert.match(events, /model-call-started/);
     assert.match(events, /model-call-failed/);
     assert.match(
-      await readFile(join(traceDirectory, 'generation.log'), 'utf8'),
+      await readFile(join(traceDirectory, 'model-draft.txt'), 'utf8'),
       /synthetic partial draft/,
     );
   } finally {

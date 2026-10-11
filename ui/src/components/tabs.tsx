@@ -11,7 +11,7 @@ import { WorkflowGraph } from '@/components/workflow-graph';
 const TYPE_COLOR: Record<string, string> = {
   conversation: 'bg-primary',
   api_request: 'bg-warning',
-  code: 'bg-[#bb9af7]',
+  code: 'bg-accent',
   end_call: 'bg-success',
 };
 

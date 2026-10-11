@@ -8,13 +8,14 @@
 // directory the CLI writes, so it appears in the inspector immediately, is
 // recorded with the same source snapshot and usage totals, and can be uploaded
 // through the existing action once it completes.
-import { stat } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { newGenerationRunId } from '../generation-trace.ts';
 import { generateFreyaJson } from '../event.ts';
 import { reasoningEfforts, parseReasoningEffort } from '../providers.ts';
 import type { ReasoningEffort } from '../providers.ts';
 import { freyaRecipe } from '../recipe.ts';
+import { listRuns } from './records.ts';
 
 /**
  * Only generations are started here: one direct-generation call that compiles a
@@ -42,6 +43,7 @@ export type GenerationOptions = {
 
 export type GenerateRunner = (options: {
   runId: string;
+  runName: string;
   out: string;
   kit: string;
   openapi: string;
@@ -69,7 +71,7 @@ export type GenerationAvailability = {
   /** Bounded by the recipe; the browser cannot raise it. */
   timeoutMs: number;
   /** The run already in flight, if any. One generation at a time. */
-  running: { runId: string; model: string } | null;
+  running: { runId: string; runName?: string; model: string } | null;
 };
 
 // These are suggestions, not an allowlist; the API decides which models are available.
@@ -77,7 +79,7 @@ export const defaultModels = ['gpt-6.1-sol', 'gpt-6-luna'];
 
 // One generation at a time: a second click would double the spend and interleave
 // two runs in one inspector. The running run is reported instead of refused.
-let running: { runId: string; model: string } | null = null;
+let running: GenerationAvailability['running'] = null;
 
 const runGeneration: GenerateRunner = (options) =>
   generateFreyaJson({
@@ -86,6 +88,7 @@ const runGeneration: GenerateRunner = (options) =>
     kit: options.kit,
     out: options.out,
     runId: options.runId,
+    runName: options.runName,
     model: options.model,
     reasoningEffort: options.reasoningEffort,
     timeoutMs: options.timeoutMs,
@@ -106,8 +109,34 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-// The kit supplies the briefs and the OpenAPI document. The browser chooses
-// which brief files by name within the kit; it never sends a path.
+// Reserve a monotonically increasing display label. The private sequence file
+// lives inside the generation directory, where discovery ignores dotfiles;
+// run records still carry the label if this file is later removed.
+async function reserveRunName(root: string): Promise<string> {
+  const generationRoot = join(resolve(root), 'generation');
+  await mkdir(generationRoot, { recursive: true, mode: 0o700 });
+  const sequencePath = join(generationRoot, '.next-run-number');
+  let savedNext = 1;
+  try {
+    const parsed = Number((await readFile(sequencePath, 'utf8')).trim());
+    if (Number.isSafeInteger(parsed) && parsed > 0) {
+      savedNext = parsed;
+    }
+  } catch {
+    // A fresh output root starts at v1.
+  }
+  const previous = await listRuns(root);
+  const largestRecorded = previous.reduce((largest, run) => {
+    const match = /^v([1-9]\d*)$/.exec(run.name ?? '');
+    return match ? Math.max(largest, Number(match[1])) : largest;
+  }, 0);
+  const next = Math.max(savedNext, largestRecorded + 1);
+  await writeFile(sequencePath, `${next + 1}\n`, { encoding: 'utf8', mode: 0o600 });
+  return `v${next}`;
+}
+
+// Brief paths stay server-owned; inspector generations use the configured
+// default brief and never accept a path from the browser.
 function briefPath(kit: string, name: string): string {
   if (!/^[\w.+-]+$/.test(name)) {
     throw new GenerateError(422, `Brief name "${name}" is not a simple file name.`);
@@ -159,6 +188,7 @@ export async function startGeneration(
   request: GenerationRequest,
 ): Promise<{
   runId: string;
+  runName: string;
   model: string;
   reasoningEffort?: ReasoningEffort;
 }> {
@@ -198,15 +228,25 @@ export async function startGeneration(
     throw new GenerateError(422, message(error));
   }
   const runId = newGenerationRunId();
-  const started = { runId, model };
+  const started: NonNullable<GenerationAvailability['running']> = { runId, model };
   running = started;
-  const briefs = [await defaultBrief(kit)];
+  let runName: string;
+  let briefs: string[];
+  try {
+    runName = await reserveRunName(options.root);
+    started.runName = runName;
+    briefs = [await defaultBrief(kit)];
+  } catch (error) {
+    running = null;
+    throw error;
+  }
   // The run's own trace records the failure if generation throws, so the browser
   // follows the run rather than this promise. Nothing here is left unhandled.
   void Promise.resolve()
     .then(() =>
       (options.generate ?? runGeneration)({
         runId,
+        runName,
         out: resolve(options.root),
         kit,
         openapi,
@@ -222,7 +262,7 @@ export async function startGeneration(
     .finally(() => {
       running = null;
     });
-  return { ...started, ...(reasoningEffort ? { reasoningEffort } : {}) };
+  return { ...started, runName, ...(reasoningEffort ? { reasoningEffort } : {}) };
 }
 
 /** Test and shutdown helper: forgets the in-flight run. */

@@ -13,37 +13,14 @@ import type { RunDetail, Upload } from '@/lib/data';
 type Availability = {
   available: boolean;
   problem: string | null;
-  /** Dashboard origin, or the configured per-workflow URL template. */
-  consoleUrl?: string | null;
-  /** True when consoleUrl is a per-workflow template, not just the origin. */
-  exact?: boolean;
 };
 type UploadResponse = { upload?: Upload; error?: string };
 
-/**
- * Link for one uploaded run's workflow. With FREYA_WORKFLOW_URL set, the
- * console answer is a per-workflow template and the ids substitute in; without
- * it, only the dashboard origin is known, deep-link routes being undocumented,
- * and the link points there honestly labeled.
- */
-function workflowLink(availability: Availability | null, upload: Upload) {
-  if (!upload.workflowId) {
+function workflowLink(upload: Upload) {
+  if (!upload.workflowUrl) {
     return null;
   }
-  const consoleUrl = availability?.consoleUrl;
-  if (!consoleUrl) {
-    return null;
-  }
-  if (availability?.exact) {
-    return {
-      href: consoleUrl
-        .replaceAll('{workflowId}', upload.workflowId)
-        .replaceAll('{agentId}', upload.agentId ?? '')
-        .replaceAll('{workspaceId}', upload.workspaceId ?? ''),
-      label: 'Open in Freya',
-    };
-  }
-  return { href: consoleUrl, label: 'Open Freya dashboard' };
+  return { href: upload.workflowUrl, label: 'Open workflow in Freya' };
 }
 
 /**
@@ -167,13 +144,13 @@ export function UploadAction({ detail }: { detail: RunDetail }) {
       {result &&
         registered &&
         (() => {
-          const link = workflowLink(availability, result);
+          const link = workflowLink(result);
           return (
             <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-lg border border-success/25 bg-success/5 px-3 py-2">
               <span className="text-[11px] font-medium text-success">
                 {result.reused ? 'Already registered' : 'Registered on Freya'}
               </span>
-              <Item label="slot" value={result.slot} />
+              <Item label="name" value={result.workflowName} />
               <Item label="workflow" value={result.workflowId} />
               <Item label="agent" value={result.agentId} />
               <Item
@@ -192,7 +169,6 @@ export function UploadAction({ detail }: { detail: RunDetail }) {
                 >
                   <ExternalLink className="size-3" />
                   {link.label}
-                  {!availability?.exact && ' (workflow id on the record)'}
                 </a>
               )}
             </div>

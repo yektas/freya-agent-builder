@@ -67,7 +67,7 @@ export function TraceTab({ detail }: { detail: RunDetail }) {
   return (
     <Section title={`Generation trace · ${detail.trace.length} entries`}>
       <p className="mb-3 text-xs text-muted-foreground">
-        Streamed drafts and summaries are grouped. Every original event remains in trace.jsonl under
+        Milestones, output counts, and failures. Read generated content and full request details in
         Files.
       </p>
       <table className="w-full text-xs">
@@ -90,21 +90,14 @@ export function TraceTab({ detail }: { detail: RunDetail }) {
                 {entry.elapsedMs === null ? '—' : `+${(entry.elapsedMs / 1000).toFixed(1)}s`}
               </td>
               <td className="py-1.5 pr-3 font-mono whitespace-nowrap">
-                {entry.streamKind || entry.kind}
+                {entry.streamKind ? 'output' : entry.kind.replaceAll('-', ' ')}
               </td>
-              <td className="py-1.5 whitespace-pre-wrap">
+              <td className="py-1.5 whitespace-pre-wrap break-words">
                 {entry.streamKind ? (
-                  <details>
-                    <summary className="cursor-pointer text-muted-foreground">
-                      {entry.streamKind === 'draft' ? 'Unvalidated draft' : 'Model summary'} ·{' '}
-                      {entry.fragments} fragments
-                      {entry.endedElapsedMs != null &&
-                        ` · through +${(entry.endedElapsedMs / 1000).toFixed(1)}s`}
-                    </summary>
-                    <pre className="mt-2 max-h-96 overflow-auto rounded-lg border border-border bg-card p-3 font-mono text-[11.5px] whitespace-pre-wrap break-all">
-                      {entry.summary.slice(entry.streamKind.length + 2)}
-                    </pre>
-                  </details>
+                  <span className="text-muted-foreground">
+                    {entry.streamKind === 'draft' ? 'Workflow draft' : 'Model summary'} ·{' '}
+                    {entry.summary}
+                  </span>
                 ) : (
                   entry.summary || '—'
                 )}

@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils';
 const TYPE_COLOR: Record<string, string> = {
   conversation: 'var(--primary)',
   api_request: 'var(--warning)',
-  code: '#bb9af7',
+  code: 'var(--accent)',
   end_call: 'var(--success)',
 };
 

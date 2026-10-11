@@ -46,7 +46,7 @@ function LiveElapsed({ detail }: { detail: RunDetail }) {
 
 function Fact({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="min-w-[140px] flex-1 bg-card px-3 py-2">
+    <div className="detail-fact min-w-[140px] flex-1 bg-card px-3 py-2">
       <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
         {label}
       </div>
@@ -58,7 +58,7 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
 /** Facts share a row via flex so a short list never leaves a dead grid cell. */
 function FactStrip({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex min-w-[420px] flex-1 flex-wrap gap-px overflow-hidden rounded-lg border border-border/60 bg-border/60">
+    <div className="detail-fact-strip flex min-w-[420px] flex-1 flex-wrap gap-px overflow-hidden rounded-2xl border border-border/60 bg-border/60">
       {children}
     </div>
   );
@@ -148,7 +148,15 @@ export function OverviewTab({ detail }: { detail: RunDetail }) {
                 {e.passed}
                 <span className="text-lg font-normal text-muted-foreground">/{e.total}</span>
               </div>
-              <div className="mt-1 text-[11px] text-muted-foreground">{e.source}</div>
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                {e.source === 'official-practice' ? 'Kit score · ledger + conversation' : e.source}
+              </div>
+              {e.conversationPassed !== null && e.conversationPassed !== undefined && (
+                <div className="mt-1 text-[11px] text-muted-foreground">
+                  Conversation checks: {e.conversationPassed}/{e.conversationTotal} across all
+                  repetitions
+                </div>
+              )}
               <div className="mt-2.5">
                 <ScoreStrip total={e.total!} passed={e.passed!} />
               </div>

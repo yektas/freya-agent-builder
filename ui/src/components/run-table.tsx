@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { ArrowDown, ArrowUp, Archive as ArchiveIcon } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Sparkles } from 'lucide-react';
 import {
   createColumnHelper,
   useTable,
@@ -18,7 +18,6 @@ import {
 } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { SidebarTrigger } from '@/components/ui/sidebar';
 import { NewRunAction } from '@/components/new-run-action';
 import { RowAction } from '@/components/delete-run';
 import { features, type DataTableFeatures } from './run-table-features';
@@ -71,23 +70,33 @@ function ScoreBar({ run }: { run: RowDataLike }) {
   const pct = e.score === null || e.score === undefined ? 0 : Math.round(e.score * 100);
   const counted = e.passed !== null && e.passed !== undefined;
   return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 w-14 shrink-0 overflow-hidden rounded-full bg-muted">
-        <div className={cn('h-full', TONE_BG[tone])} style={{ width: `${pct}%` }} />
+    <div title={e.details ?? undefined}>
+      {e.source === 'official-practice' && (
+        <div className="mb-1 text-[10px] text-muted-foreground">Kit score</div>
+      )}
+      <div className="flex items-center gap-2">
+        <div className="h-1.5 w-14 shrink-0 overflow-hidden rounded-full bg-muted">
+          <div className={cn('h-full', TONE_BG[tone])} style={{ width: `${pct}%` }} />
+        </div>
+        <span
+          className={cn(
+            'min-w-9 font-mono text-xs tabular-nums',
+            tone === 'good' && 'text-success',
+            tone === 'warn' && 'text-warning',
+            tone === 'bad' && 'text-destructive',
+            tone === 'none' && 'text-muted-foreground',
+          )}
+        >
+          {e.score === null || e.score === undefined
+            ? '—'
+            : `${counted ? e.passed : pct}${counted ? `/${e.total ?? 0}` : '%'}`}
+        </span>
       </div>
-      <span
-        className={cn(
-          'min-w-9 font-mono text-xs tabular-nums',
-          tone === 'good' && 'text-success',
-          tone === 'warn' && 'text-warning',
-          tone === 'bad' && 'text-destructive',
-          tone === 'none' && 'text-muted-foreground',
-        )}
-      >
-        {e.score === null || e.score === undefined
-          ? '—'
-          : `${counted ? e.passed : pct}${counted ? `/${e.total ?? 0}` : '%'}`}
-      </span>
+      {e.conversationPassed !== null && e.conversationPassed !== undefined && (
+        <div className="mt-1 text-[10px] text-muted-foreground">
+          Conversation {e.conversationPassed}/{e.conversationTotal}
+        </div>
+      )}
     </div>
   );
 }
@@ -99,10 +108,41 @@ function TokenCell({ run }: { run: RowDataLike }) {
     return <span className="text-muted-foreground">—</span>;
   }
   return (
-    <div className="font-mono leading-tight">
-      <div className="tabular-nums">{tokens(usage.totalTokens)}</div>
-      <div className="text-[10px] tabular-nums text-muted-foreground">
+    <div className="usage-cell">
+      <div className="font-mono tabular-nums">{tokens(usage.totalTokens)}</div>
+      <div className="usage-detail font-mono tabular-nums">
         {tokens(usage.inputTokens)} in · {tokens(usage.outputTokens)} out
+      </div>
+      <div className="usage-cost font-mono">{usd(usage.usd)}</div>
+    </div>
+  );
+}
+
+function RunCell({ run }: { run: RowDataLike }) {
+  const badges = [
+    run.archived ? <Badge key="archived">archived</Badge> : null,
+    run.synthetic ? (
+      <Badge key="synthetic" variant="warning" className="border-warning/40 text-warning">
+        synthetic
+      </Badge>
+    ) : null,
+    run.error ? (
+      <Badge key="error" variant="destructive" className="border-destructive/40 text-destructive">
+        error
+      </Badge>
+    ) : null,
+  ].filter(Boolean);
+
+  return (
+    <div className="run-cell">
+      <div className="run-cell-title">
+        <span className="min-w-0 truncate font-medium">{run.title}</span>
+        {badges}
+      </div>
+      <div className="run-cell-meta">
+        <span>{kindLabel(run.kind)}</span>
+        {run.model && <span>{run.model}</span>}
+        <span>{ago(run.startedAt)}</span>
       </div>
     </div>
   );
@@ -133,9 +173,26 @@ function SortButton({ column, children }: { column: SortColumn; children: React.
 }
 
 const columns = columnHelper.columns([
+  columnHelper.accessor((run) => sortValue(run, 'started'), {
+    id: 'started',
+    header: ({ column }) => <SortButton column={column}>Run</SortButton>,
+    cell: ({ row }) => <RunCell run={row.original} />,
+  }),
+  columnHelper.accessor((run) => sortValue(run, 'briefName'), {
+    id: 'briefName',
+    header: ({ column }) => <SortButton column={column}>Brief</SortButton>,
+    cell: ({ row }) => (
+      <span
+        className="run-brief-name block max-w-[280px] truncate text-xs text-muted-foreground"
+        title={row.original.briefName ?? undefined}
+      >
+        {row.original.briefName ?? '—'}
+      </span>
+    ),
+  }),
   columnHelper.accessor((run) => sortValue(run, 'score'), {
     id: 'score',
-    header: ({ column }) => <SortButton column={column}>Score</SortButton>,
+    header: ({ column }) => <SortButton column={column}>Evaluation</SortButton>,
     cell: ({ row }) => <ScoreBar run={row.original} />,
   }),
   columnHelper.accessor((run) => run.status, {
@@ -148,71 +205,16 @@ const columns = columnHelper.columns([
       </span>
     ),
   }),
-  columnHelper.accessor((run) => run.title, {
-    id: 'title',
-    header: ({ column }) => <SortButton column={column}>Run</SortButton>,
-    cell: ({ row }) => {
-      const run = row.original;
-      return (
-        <div className="whitespace-nowrap">
-          <span className="font-medium">{run.title}</span>
-          {run.archived && (
-            <Badge className="ml-1.5 border-muted text-muted-foreground">archived</Badge>
-          )}
-          {run.synthetic && (
-            <Badge variant="warning" className="ml-1.5 border-warning/40 text-warning">
-              synthetic
-            </Badge>
-          )}
-          {run.error && (
-            <Badge variant="destructive" className="ml-1.5 border-destructive/40 text-destructive">
-              error
-            </Badge>
-          )}
-        </div>
-      );
-    },
-  }),
-  columnHelper.accessor((run) => kindLabel(run.kind), {
-    id: 'kind',
-    header: ({ column }) => <SortButton column={column}>Kind</SortButton>,
-    cell: ({ row }) => (
-      <span className="text-muted-foreground">{kindLabel(row.original.kind)}</span>
-    ),
-  }),
-  columnHelper.accessor((run) => run.model ?? '', {
-    id: 'model',
-    header: ({ column }) => <SortButton column={column}>Model</SortButton>,
-    cell: ({ row }) => (
-      <span className="font-mono text-muted-foreground">{row.original.model ?? '—'}</span>
-    ),
-  }),
   columnHelper.accessor((run) => sortValue(run, 'tokens'), {
     id: 'tokens',
-    header: ({ column }) => <SortButton column={column}>Tokens</SortButton>,
+    header: ({ column }) => <SortButton column={column}>Usage</SortButton>,
     cell: ({ row }) => <TokenCell run={row.original} />,
-  }),
-  columnHelper.accessor((run) => sortValue(run, 'cost'), {
-    id: 'cost',
-    header: ({ column }) => <SortButton column={column}>Cost</SortButton>,
-    cell: ({ row }) => (
-      <span className="font-mono text-muted-foreground">
-        {row.original.usage ? usd(row.original.usage.usd) : '—'}
-      </span>
-    ),
   }),
   columnHelper.accessor((run) => sortValue(run, 'elapsed'), {
     id: 'elapsed',
     header: ({ column }) => <SortButton column={column}>Elapsed</SortButton>,
     cell: ({ row }) => (
       <span className="font-mono text-muted-foreground">{ms(row.original.elapsedMs)}</span>
-    ),
-  }),
-  columnHelper.accessor((run) => sortValue(run, 'started'), {
-    id: 'started',
-    header: ({ column }) => <SortButton column={column}>Started</SortButton>,
-    cell: ({ row }) => (
-      <span className="font-mono text-muted-foreground">{ago(row.original.startedAt)}</span>
     ),
   }),
   // Display column per the guide: the row action, with no accessor.
@@ -240,8 +242,9 @@ const columns = columnHelper.columns([
 export function RunTable({
   runs,
   selected,
+  filter,
+  onFilter,
   archivedView,
-  onToggleArchived,
   onSelect,
   onStarted,
   onArchived,
@@ -249,8 +252,9 @@ export function RunTable({
 }: {
   runs: RunSummary[];
   selected: string | null;
+  filter: string;
+  onFilter: (filter: string) => void;
   archivedView: boolean;
-  onToggleArchived: (show: boolean) => void;
   onSelect: (id: string) => void;
   onStarted: (run: StartedRun) => void;
   onArchived: (id: string, archivedId: string) => void;
@@ -284,86 +288,240 @@ export function RunTable({
   const live = runs.filter(isRunning).length;
 
   const rows = table.getRowModel().rows;
+  const scoreRuns = runs
+    .filter((run) => run.evaluation.score !== null && run.evaluation.score !== undefined)
+    .slice(0, 8)
+    .reverse();
+
+  const filterOptions = [
+    ['all', 'All runs'],
+    ['freya-live-run', 'Freya'],
+    ['generation-only', 'Generated'],
+    ['local-build', 'Local builds'],
+  ] as const;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center gap-3 border-b border-border px-5 py-3">
-        <SidebarTrigger className="-ml-1" />
-        <h2 className="text-sm font-semibold">{archivedView ? 'Archive' : 'All runs'}</h2>
-        <p className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
-          {runs.length} recorded · {scored.length} scored
-          {mean !== null && (
-            <>
-              {' '}
-              · mean <span className="font-mono">{Math.round(mean * 100)}%</span>
-            </>
-          )}
-          {failed > 0 && (
-            <>
-              {' '}
-              · <span className="text-destructive">{failed} failed</span>
-            </>
-          )}
-          {live > 0 && (
-            <>
-              {' '}
-              · <span className="text-warning">{live} running</span>
-            </>
-          )}
-        </p>
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-pressed={archivedView}
-          onClick={() => onToggleArchived(!archivedView)}
-          title={archivedView ? 'Show the live run list' : 'Show archived runs (restorable)'}
-        >
-          <ArchiveIcon className="size-3.5" />
-          {archivedView ? 'Back to runs' : 'Archive'}
-        </Button>
-        <NewRunAction onStarted={onStarted} />
-      </div>
-      <div className="min-h-0 flex-1 overflow-auto">
-        <Table>
-          <TableHeader className="sticky top-0 z-10 bg-background">
-            {table.getHeaderGroups().map((headerGroup) => (
-              <TableRow key={headerGroup.id} className="hover:bg-transparent">
-                {headerGroup.headers.map((header) => (
-                  <TableHead key={header.id}>
-                    {header.isPlaceholder ? null : <FlexRender header={header} />}
-                  </TableHead>
-                ))}
-              </TableRow>
-            ))}
-          </TableHeader>
-          <TableBody>
-            {rows.length ? (
-              rows.map((row) => (
-                <TableRow
-                  key={row.id}
-                  onClick={() => onSelect(row.original.id)}
-                  aria-current={row.original.id === selected}
-                  className={cn('cursor-pointer', row.original.id === selected && 'bg-muted')}
-                >
-                  {row.getVisibleCells().map((cell) => (
-                    <TableCell key={cell.id}>
-                      <FlexRender cell={cell} />
-                    </TableCell>
-                  ))}
-                </TableRow>
-              ))
+    <div className="history-page">
+      <div className="history-hero">
+        <section className="history-heading">
+          <div className="history-title-copy">
+            <p className="eyebrow">
+              BUILDER WORKSPACE <span>/</span> {archivedView ? 'ARCHIVE' : 'RUNS'}
+            </p>
+            <h1>
+              {archivedView ? (
+                <>
+                  Archived <span className="headline-accent">runs</span>
+                </>
+              ) : (
+                <>
+                  Run <span className="headline-accent">history</span>
+                </>
+              )}
+            </h1>
+            <p className="history-subtitle">
+              Review each generation, its evaluation, and the artifacts behind it.
+            </p>
+          </div>
+        </section>
+
+        <section className="run-metrics" aria-label="Run summary">
+          <div className="run-panel-chrome" aria-hidden="true">
+            <span className="run-panel-dots">
+              <i />
+              <i />
+              <i />
+            </span>
+            <span className="run-panel-path">FREYA / WORKSPACE / RUNS</span>
+            <span className="run-panel-status">
+              <span /> {live ? 'LIVE GENERATION' : 'MONITORING'}
+            </span>
+          </div>
+          <div className="run-metrics-grid">
+            <Metric label="Runs in view" value={String(runs.length)} />
+            <Metric
+              label="Mean evaluation"
+              value={mean === null ? '—' : `${Math.round(mean * 100)}%`}
+            />
+            <Metric
+              label="In progress"
+              value={String(live)}
+              detail={
+                live ? <Activity className="size-3.5 animate-pulse-dot text-warning" /> : undefined
+              }
+            />
+            <Metric label="Scored" value={String(scored.length)} />
+          </div>
+          <div className="run-score-chart">
+            <div className="run-score-chart-heading">
+              <span>Evaluation history</span>
+              <span>{scoreRuns.length} scored runs</span>
+            </div>
+            {scoreRuns.length ? (
+              <div
+                className="run-score-chart-bars"
+                role="img"
+                aria-label={`Scores for the ${scoreRuns.length} most recent evaluated runs`}
+              >
+                {scoreRuns.map((run) => {
+                  const score = run.evaluation.score ?? 0;
+                  const percent = Math.round(score * 100);
+                  return (
+                    <span
+                      key={run.id}
+                      className="run-score-chart-bar"
+                      style={{ height: `${Math.max(percent, 3)}%` }}
+                      title={`${run.title} · ${percent}%`}
+                    />
+                  );
+                })}
+              </div>
             ) : (
-              <TableRow className="hover:bg-transparent">
-                <TableCell
-                  colSpan={columns.length}
-                  className="py-14 text-center text-muted-foreground"
-                >
-                  No runs recorded yet.
-                </TableCell>
-              </TableRow>
+              <p className="run-score-chart-empty">Scores appear here as runs are evaluated.</p>
             )}
-          </TableBody>
-        </Table>
+          </div>
+        </section>
+      </div>
+
+      <section className="run-library" aria-label="Recorded runs">
+        <div className="run-library-toolbar">
+          <div className="filter-group" role="group" aria-label="Filter runs by type">
+            {filterOptions.map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={filter === value}
+                onClick={() => onFilter(value)}
+                className={cn('filter-button', filter === value && 'filter-button-active')}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="result-count">
+            <span>{runs.length}</span> {runs.length === 1 ? 'run' : 'runs'}
+            {failed > 0 && <span className="result-failed"> · {failed} failed</span>}
+          </p>
+        </div>
+
+        {rows.length ? (
+          <div className="run-table-scroll">
+            <Table className="run-table min-w-[960px]">
+              <TableHeader className="sticky top-0 z-10 bg-card/95 backdrop-blur">
+                {table.getHeaderGroups().map((headerGroup) => (
+                  <TableRow key={headerGroup.id} className="run-table-heading hover:bg-transparent">
+                    {headerGroup.headers.map((header) => (
+                      <TableHead key={header.id}>
+                        {header.isPlaceholder ? null : <FlexRender header={header} />}
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                ))}
+              </TableHeader>
+              <TableBody>
+                {rows.map((row) => (
+                  <TableRow
+                    key={row.id}
+                    tabIndex={0}
+                    onClick={() => onSelect(row.original.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        onSelect(row.original.id);
+                      }
+                    }}
+                    aria-current={row.original.id === selected}
+                    className={cn(
+                      'run-table-row cursor-pointer',
+                      row.original.id === selected && 'run-table-row-selected',
+                    )}
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <TableCell key={cell.id}>
+                        <FlexRender cell={cell} />
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        ) : (
+          <EmptyState firstRun={filter === 'all' && !archivedView} onStarted={onStarted} />
+        )}
+      </section>
+    </div>
+  );
+}
+
+function Metric({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: string;
+  detail?: React.ReactNode;
+}) {
+  return (
+    <div className="run-metric">
+      <span className="run-metric-label">{label}</span>
+      <span className="run-metric-value">
+        {value}
+        {detail}
+      </span>
+    </div>
+  );
+}
+
+function EmptyState({
+  firstRun,
+  onStarted,
+}: {
+  firstRun: boolean;
+  onStarted: (run: StartedRun) => void;
+}) {
+  if (!firstRun) {
+    return <p className="empty-filter-state">No runs match this filter.</p>;
+  }
+
+  return (
+    <div className="empty-state">
+      <div className="empty-state-copy">
+        <p className="empty-kicker">YOUR NEXT RUN STARTS HERE</p>
+        <h2>No generations recorded</h2>
+        <p>
+          Generate a workflow from the configured event package. The builder compiles it locally;
+          registration remains a separate step.
+        </p>
+        <NewRunAction
+          onStarted={onStarted}
+          trigger={
+            <Button size="lg" className="generate-button">
+              <Sparkles className="size-4" />
+              Start a generation
+            </Button>
+          }
+        />
+      </div>
+      <div className="empty-flow" aria-label="Generation flow">
+        <div className="empty-flow-step">
+          <span className="empty-flow-index">01</span>
+          <span className="empty-flow-title">Event task</span>
+          <span className="empty-flow-caption">Original task + tools</span>
+        </div>
+        <span className="empty-flow-connector" />
+        <div className="empty-flow-step empty-flow-step-active">
+          <span className="empty-flow-index">02</span>
+          <span className="empty-flow-title">Agent workflow</span>
+          <span className="empty-flow-caption">One direct generation</span>
+        </div>
+        <span className="empty-flow-connector" />
+        <div className="empty-flow-step">
+          <span className="empty-flow-index">03</span>
+          <span className="empty-flow-title">Local compile</span>
+          <span className="empty-flow-caption">Inspect before upload</span>
+        </div>
       </div>
     </div>
   );

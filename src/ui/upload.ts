@@ -3,10 +3,10 @@
 // a recorded generation without another model call. Credentials stay in this
 // process: the browser asks for an upload and receives ids, never a key.
 //
-// Every remote step reuses the unchanged organizer bridge, so the event model,
-// tool bindings, and workflow document are exactly what a CLI run would send.
+// Every remote step uses the event package client, preserving its workflow
+// document and publication behavior while assigning an inspector-friendly name.
 import { mkdir, open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, extname, join, resolve } from 'node:path';
 import type { JsonObject } from '../contracts.ts';
 import { hash } from '../experiments.ts';
 import { FreyaBridge } from '../freya.ts';
@@ -42,10 +42,14 @@ export type UploadView = {
   status: UploadStatus;
   /** The step reached, so a failure names the operation that stopped. */
   stage: string;
+  /** Human-readable name sent to Freya on first registration. */
+  workflowName: string | null;
   slot: string;
   workspaceId: string | null;
   workflowId: string | null;
   agentId: string | null;
+  /** Direct Freya workflow route, ready to open after registration. */
+  workflowUrl: string | null;
   version: number | null;
   /** Hash of the compiled document that was sent, used to detect a repeat. */
   workflowHash: string | null;
@@ -127,27 +131,97 @@ function message(error: unknown): string {
 }
 
 /**
- * Console link info for a registered workflow. Freya's dashboard is an SPA whose
- * deep-link routes are not documented (verified: only /api/v2 endpoints are),
- * so the per-workflow route is configuration: FREYA_WORKFLOW_URL, with
- * {workflowId}, {agentId}, and {workspaceId} placeholders, for example
- * https://app.freyavoice.ai/workflows/{workflowId}. FREYA_API_URL supplies the
- * fallback dashboard origin. The template is answered once as "consoleUrl"; ids
- * from a run's upload record are substituted client-side, never sent to the
- * server.
+ * The event package uses the staging app. The workflow deep link is supplied by
+ * the task's verified dashboard example; deployments can override it with
+ * FREYA_WORKFLOW_URL when the app route differs.
  */
-export function workflowConsole(env: NodeJS.ProcessEnv): {
-  /** Dashboard origin, or the configured per-workflow template. */
-  consoleUrl: string | null;
-  /** True when consoleUrl is a per-workflow template, not just the origin. */
-  exact: boolean;
-} {
+export function workflowConsole(env: NodeJS.ProcessEnv): string | null {
   const template = env.FREYA_WORKFLOW_URL?.trim();
   if (template) {
-    return { consoleUrl: template, exact: true };
+    const probe = template
+      .replaceAll('{workflowId}', 'workflow-id')
+      .replaceAll('{agentId}', 'agent-id')
+      .replaceAll('{workspaceId}', 'workspace-id');
+    try {
+      const parsed = new URL(probe);
+      const containsCredential = [...parsed.searchParams.keys()].some((key) =>
+        /^(authorization|auth|bearer|token|access[_-]?token|api[_-]?key|secret|password|credential|key)$/i.test(
+          key,
+        ),
+      );
+      if (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        !parsed.username &&
+        !parsed.password &&
+        !parsed.hash &&
+        !containsCredential
+      ) {
+        return template;
+      }
+    } catch {
+      // Invalid console configuration should not become a clickable browser URL.
+    }
   }
-  const origin = env.FREYA_API_URL?.trim();
-  return origin ? { consoleUrl: origin, exact: false } : { consoleUrl: null, exact: false };
+  try {
+    const api = new URL(env.FREYA_API_URL?.trim() || 'https://staging-app.freyavoice.ai');
+    if (api.protocol !== 'http:' && api.protocol !== 'https:') {
+      return null;
+    }
+    return `${api.origin}/workflow/{workflowId}?workspaceId={workspaceId}`;
+  } catch {
+    return null;
+  }
+}
+
+function workflowUrl(
+  template: string | null,
+  workflowId: string | null,
+  workspaceId: string | null,
+  agentId: string | null,
+) {
+  if (!template || !workflowId || !workspaceId) {
+    return null;
+  }
+  return template
+    .replaceAll('{workflowId}', encodeURIComponent(workflowId))
+    .replaceAll('{agentId}', agentId ? encodeURIComponent(agentId) : '')
+    .replaceAll('{workspaceId}', encodeURIComponent(workspaceId));
+}
+
+/** Resolve the browser-safe workflow URL for an existing registration. */
+export function resolveWorkflowUrl(
+  env: NodeJS.ProcessEnv,
+  workflowId: string | null,
+  workspaceId: string | null,
+  agentId: string | null,
+): string | null {
+  return workflowUrl(workflowConsole(env), workflowId, workspaceId, agentId);
+}
+
+async function readableWorkflowName(runFile: string): Promise<string> {
+  try {
+    const raw: unknown = JSON.parse(await readFile(runFile, 'utf8'));
+    if (!object(raw)) {
+      throw new Error('run record is not an object');
+    }
+    const config = object(raw.config) ? raw.config : {};
+    const briefs = Array.isArray(config.briefs)
+      ? config.briefs
+          .filter((brief): brief is string => typeof brief === 'string')
+          .map((brief) => basename(brief, extname(brief)))
+          .map((brief) => brief.replace(/[^a-z0-9]+/gi, ' ').trim())
+          .filter(Boolean)
+      : [];
+    const label = briefs.length ? briefs.slice(0, 3).join(' + ') : 'Generated workflow';
+    const first = label.replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+    const started = typeof raw.startedAt === 'string' ? Date.parse(raw.startedAt) : Number.NaN;
+    const timestamp = Number.isFinite(started)
+      ? `${new Date(started).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      : null;
+    return `${first}${timestamp ? ` | ${timestamp}` : ''}`.slice(0, 100);
+  } catch {
+    return 'Generated workflow';
+  }
 }
 
 // Upload needs the workspace key and the event package. Practice testing, which
@@ -265,6 +339,7 @@ async function register(options: UploadOptions, runId: string): Promise<UploadVi
   }
 
   const slot = uploadSlot(runId);
+  const name = await readableWorkflowName(found.run.runFile);
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const deadline = started + timeoutMs;
@@ -272,10 +347,12 @@ async function register(options: UploadOptions, runId: string): Promise<UploadVi
   const record: UploadView = {
     status: 'failed',
     stage: 'probe',
+    workflowName: name,
     slot,
     workspaceId: null,
     workflowId: null,
     agentId: null,
+    workflowUrl: null,
     version: null,
     workflowHash: hash(workflow),
     exportedPath: null,
@@ -339,6 +416,10 @@ async function register(options: UploadOptions, runId: string): Promise<UploadVi
         record.stage = 'done';
         record.workflowId = previous.workflowId;
         record.agentId = previous.agentId;
+        record.workflowName = previous.workflowName ?? null;
+        record.workflowUrl =
+          previous.workflowUrl ??
+          workflowUrl(workflowConsole(env), record.workflowId, record.workspaceId, record.agentId);
         record.version = Number.isInteger(previous.version) ? previous.version : null;
         record.exportedPath = previous.exportedPath;
         record.reused = true;
@@ -352,9 +433,14 @@ async function register(options: UploadOptions, runId: string): Promise<UploadVi
         throw new UploadError(409, reconcileMessage(pending, trace));
       }
       record.stage = 'validate';
-      await call('validate', { slot, workflow });
+      await call('validate', { slot, workflow, workflowName: name });
       record.stage = 'register';
-      const registration = await call('register', { slot, workflow, stateFile });
+      const registration = await call('register', {
+        slot,
+        workflow,
+        workflowName: name,
+        stateFile,
+      });
       record.stage = 'export';
       const exported = await call('export', {
         workflowId: registration?.workflow_id,
@@ -365,6 +451,12 @@ async function register(options: UploadOptions, runId: string): Promise<UploadVi
       record.workflowId =
         typeof registration?.workflow_id === 'string' ? registration.workflow_id : null;
       record.agentId = typeof registration?.agent_id === 'string' ? registration.agent_id : null;
+      record.workflowUrl = workflowUrl(
+        workflowConsole(env),
+        record.workflowId,
+        record.workspaceId,
+        record.agentId,
+      );
       record.version = Number.isInteger(registration?.version) ? registration.version : null;
       record.exportedPath =
         object(exported) && typeof exported.path === 'string' ? exported.path : null;

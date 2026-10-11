@@ -50,7 +50,8 @@ def urlopen(request, **kwargs):
     node = (body or {}).get('workflow', {}).get('initial_node')
     with requests.open('a') as out:
         out.write(json.dumps({'method': request.get_method(), 'path': parsed.path,
-                              'query': parsed.query, 'initial_node': node}) + '\\n')
+                              'query': parsed.query, 'initial_node': node,
+                              'name': (body or {}).get('name')}) + '\\n')
     if node == 'slow':
         # Ignores the abort signal, exactly like a call the platform never
         # answers; the caller has to stop waiting on its own deadline.
@@ -95,6 +96,7 @@ type Request = {
   path: string;
   query: string;
   initial_node: string | null;
+  name: string | null;
 };
 
 type Harness = {
@@ -143,6 +145,7 @@ async function harness(
     SYNTHETIC_TRANSPORT_ROOT: transport,
     FREYA_API_KEY: SECRET,
     FREYA_WORKSPACE_ID: 'synthetic-workspace',
+    FREYA_API_URL: 'https://staging-app.freyavoice.ai',
     ...options.uploadEnv,
   } as NodeJS.ProcessEnv;
   const server = createUiServer({
@@ -220,8 +223,13 @@ test('registers a compiled workflow, records it, and survives a refresh', async 
   const upload = first.body.upload!;
   assert.equal(upload.status, 'registered');
   assert.equal(upload.stage, 'done');
+  assert.equal(upload.workflowName, 'Brief A | 2026-10-10 12:00 UTC');
   assert.equal(upload.workflowId, 'synthetic-workflow');
   assert.equal(upload.agentId, 'synthetic-agent');
+  assert.equal(
+    upload.workflowUrl,
+    'https://staging-app.freyavoice.ai/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
   assert.equal(upload.reused, false);
   assert.equal(upload.slot, uploadSlot('generation~gen-accept'));
   assert.equal(upload.workspaceId, 'synthetic-workspace');
@@ -241,6 +249,10 @@ test('registers a compiled workflow, records it, and survives a refresh', async 
       'GET /api/v2/workflow/synthetic-workflow',
     ],
   );
+  const create = (await h.requests()).find(
+    (item) => item.method === 'POST' && !item.query.includes('dryRun'),
+  );
+  assert.equal(create?.name, 'Brief A | 2026-10-10 12:00 UTC');
   // The dry run stored nothing; exactly one workflow was created.
   assert.equal(await h.creates(), 1);
 
@@ -255,6 +267,11 @@ test('registers a compiled workflow, records it, and survives a refresh', async 
   assert.equal(detail?.upload?.status, 'registered');
   assert.equal(detail?.upload?.workflowId, 'synthetic-workflow');
   assert.equal(detail?.upload?.agentId, 'synthetic-agent');
+  assert.equal(detail?.upload?.workflowName, 'Brief A | 2026-10-10 12:00 UTC');
+  assert.equal(
+    detail?.upload?.workflowUrl,
+    'https://staging-app.freyavoice.ai/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
   assert.equal(
     detail?.summary.files.some((file) => file.name === 'upload.json'),
     true,
@@ -264,6 +281,32 @@ test('registers a compiled workflow, records it, and survives a refresh', async 
   );
   assert.equal(served.status, 200);
   assert.equal(((await served.json()) as UploadView).agentId, 'synthetic-agent');
+});
+
+test('serves a direct link for legacy registrations without rewriting their record', async () => {
+  const h = await harness();
+  const registered = await post(h.base, 'generation~gen-accept');
+  assert.equal(registered.status, 200);
+
+  const uploadPath = join(h.root, 'generation', 'gen-accept', 'upload.json');
+  const legacyRecord = JSON.parse(await readFile(uploadPath, 'utf8')) as Record<string, unknown>;
+  delete legacyRecord.workflowUrl;
+  await writeFile(uploadPath, JSON.stringify(legacyRecord, null, 2));
+  const requestsBeforeRead = await h.requests();
+
+  const detailResponse = await fetch(`${h.base}/api/runs/generation~gen-accept`);
+  assert.equal(detailResponse.status, 200);
+  const detail = (await detailResponse.json()) as {
+    upload: UploadView | null;
+  };
+  assert.equal(
+    detail.upload?.workflowUrl,
+    'https://staging-app.freyavoice.ai/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
+
+  const storedRecord = JSON.parse(await readFile(uploadPath, 'utf8')) as Record<string, unknown>;
+  assert.equal('workflowUrl' in storedRecord, false);
+  assert.deepEqual(await h.requests(), requestsBeforeRead);
 });
 
 test('a repeated click returns the recorded registration instead of creating again', async () => {
@@ -284,6 +327,8 @@ test('a repeated click returns the recorded registration instead of creating aga
     assert.equal(repeat.body.upload?.reused, true);
     assert.equal(repeat.body.upload?.workflowId, first.body.upload?.workflowId);
     assert.equal(repeat.body.upload?.agentId, first.body.upload?.agentId);
+    assert.equal(repeat.body.upload?.workflowName, first.body.upload?.workflowName);
+    assert.equal(repeat.body.upload?.workflowUrl, first.body.upload?.workflowUrl);
   }
   assert.equal(await h.creates(), creates);
 
@@ -313,6 +358,22 @@ test('a repeated click returns the recorded registration instead of creating aga
   const paths = (await h.requests()).map((item) => `${item.method} ${item.path}`);
   assert.equal(paths.includes('PUT /api/v2/workflow/synthetic-workflow'), true);
   assert.equal(paths.includes('POST /api/v2/versions/workflow/synthetic-workflow/publish'), true);
+});
+
+test('uses every brief filename in a readable multi-brief workflow name', async () => {
+  const h = await harness();
+  const runFile = join(h.root, 'generation', 'gen-accept', 'run.json');
+  const run = JSON.parse(await readFile(runFile, 'utf8')) as Record<string, any>;
+  run.config.briefs.push('build-the-builder/briefs/brief-b.md');
+  await writeFile(runFile, JSON.stringify(run));
+
+  const response = await post(h.base, 'generation~gen-accept');
+  assert.equal(response.status, 200);
+  assert.equal(response.body.upload?.workflowName, 'Brief A + Brief B | 2026-10-10 12:00 UTC');
+  const create = (await h.requests()).find(
+    (item) => item.method === 'POST' && !item.query.includes('dryRun'),
+  );
+  assert.equal(create?.name, 'Brief A + Brief B | 2026-10-10 12:00 UTC');
 });
 
 test('a rejected dry run stops before any creation and says what failed', async () => {
@@ -468,54 +529,78 @@ test('a platform that never answers is stopped by the operation deadline', async
   );
 });
 
-test('the console link answers the api origin, or a configured workflow template', async () => {
-  // No FREYA_API_URL in the injected env: no link can exist, rather than one
-  // pointing at the default production host.
+test('upload returns only a resolved workflow URL and rejects credential-bearing templates', async () => {
+  // The package's default staging origin produces a ready direct workflow URL.
   const bare = await harness({
     uploadEnv: {
       ...process.env,
       FREYA_API_KEY: SECRET,
       FREYA_WORKSPACE_ID: 'synthetic-workspace',
-      FREYA_API_URL: '',
       FREYA_WORKFLOW_URL: '',
     },
   });
   const empty = await (await fetch(`${bare.base}/api/upload`)).json();
-  assert.deepEqual(empty.consoleUrl, null);
-  assert.equal(empty.exact, false);
+  assert.equal(Object.hasOwn(empty, 'consoleUrl'), false);
+  const defaultUpload = await post(bare.base, 'generation~gen-accept');
+  assert.equal(defaultUpload.status, 200);
+  assert.equal(
+    defaultUpload.body.upload?.workflowUrl,
+    'https://staging-app.freyavoice.ai/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
 
-  // The dashboard origin is the honest fallback when no deep route is known.
+  // FREYA_API_URL selects the origin while the verified event route adds ids.
   const origin = await harness({
     uploadEnv: {
       ...process.env,
       FREYA_API_KEY: SECRET,
       FREYA_WORKSPACE_ID: 'synthetic-workspace',
-      FREYA_API_URL: 'https://staging-app.freyavoice.ai',
+      FREYA_API_URL: 'https://freya.example',
       FREYA_WORKFLOW_URL: '',
     },
   });
-  const fallback = await (await fetch(`${origin.base}/api/upload`)).json();
-  assert.equal(fallback.consoleUrl, 'https://staging-app.freyavoice.ai');
-  assert.equal(fallback.exact, false);
+  const fallback = await post(origin.base, 'generation~gen-accept');
+  assert.equal(fallback.status, 200);
+  assert.equal(
+    fallback.body.upload?.workflowUrl,
+    'https://freya.example/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
 
-  // A configured template is marked exact, so the UI substitutes run ids into
-  // it client-side. The template itself carries no ids and no secret.
+  // A configured template overrides the default route. Upload returns the fully
+  // substituted link, rather than making the browser reconstruct it.
   const templated = await harness({
     uploadEnv: {
       ...process.env,
       FREYA_API_KEY: SECRET,
       FREYA_WORKSPACE_ID: 'synthetic-workspace',
       FREYA_API_URL: 'https://staging-app.freyavoice.ai',
-      FREYA_WORKFLOW_URL: 'https://staging-app.freyavoice.ai/workflows/{workflowId}',
+      FREYA_WORKFLOW_URL:
+        'https://staging-app.freyavoice.ai/workflow/{workflowId}?workspaceId={workspaceId}',
     },
   });
-  const exact = await (await fetch(`${templated.base}/api/upload`)).json();
-  assert.equal(exact.consoleUrl, 'https://staging-app.freyavoice.ai/workflows/{workflowId}');
-  assert.equal(exact.exact, true);
-  // Registering still works with a template configured.
   const uploaded = await post(templated.base, 'generation~gen-accept');
   assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
   assert.equal(uploaded.body.upload?.workflowId, 'synthetic-workflow');
+  assert.equal(
+    uploaded.body.upload?.workflowUrl,
+    'https://staging-app.freyavoice.ai/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
+
+  const secretTemplate = await harness({
+    uploadEnv: {
+      ...process.env,
+      FREYA_API_KEY: SECRET,
+      FREYA_WORKSPACE_ID: 'synthetic-workspace',
+      FREYA_API_URL: 'https://staging-app.freyavoice.ai',
+      FREYA_WORKFLOW_URL: `https://staging-app.freyavoice.ai/workflow/{workflowId}?api_key=${SECRET}`,
+    },
+  });
+  const safeFallback = await post(secretTemplate.base, 'generation~gen-accept');
+  assert.equal(safeFallback.status, 200);
+  assert.equal(
+    safeFallback.body.upload?.workflowUrl,
+    'https://staging-app.freyavoice.ai/workflow/synthetic-workflow?workspaceId=synthetic-workspace',
+  );
+  assert.equal(JSON.stringify(safeFallback.body).includes(SECRET), false);
 });
 
 test('recorded runs stay read-only: only the upload route accepts a write', async () => {

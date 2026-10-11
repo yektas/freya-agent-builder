@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { hash, projectRoot } from './experiments.ts';
 import { assertPracticeInputs } from './practice-inputs.ts';
 import { object } from './validation.ts';
+import { parseFreyaStrategy } from './strategies.ts';
 
 export function practiceEvidence(result: any, ledgers: Map<string, any>) {
   const missing = {
@@ -175,6 +176,8 @@ export async function compareRuns(files: string[]) {
       sourceHash: run.source?.hash ?? null,
       model: run.config?.model ?? null,
       reasoningEffort: run.config?.reasoningEffort ?? null,
+      strategy: parseFreyaStrategy(run.config?.strategy ?? 'direct'),
+      instructionsHash: run.config?.instructionsHash ?? null,
       selection,
       comparisonGroup: selection.caseHash && selectedBrief ? hash(selection) : null,
       ...evidence,

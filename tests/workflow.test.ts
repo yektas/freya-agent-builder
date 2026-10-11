@@ -2,8 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
-import { toolsFromOpenAPI, compileWorkflow, loadFreyaTask } from '../src/workflow.ts';
+import {
+  toolsFromOpenAPI,
+  compileWorkflow,
+  loadFreyaTask,
+  relaxInvalidEscapes,
+} from '../src/workflow.ts';
 import { freyaRecipe } from '../src/recipe.ts';
+import { routingComplexity, routingSafetyIssues } from '../src/routing-safety.ts';
 import type { Task } from '../src/contracts.ts';
 
 const openapi = JSON.parse(
@@ -30,6 +36,26 @@ const blueprint = () => ({
   },
 });
 const candidate = (value: unknown) => ({ workflowJson: JSON.stringify(value), uncertainties: [] });
+
+test('an invalid escape does not cost a paid generation, and valid JSON is untouched', () => {
+  // Recorded 2026-10-11 16:05 run: the model wrote \' inside a JSON string, which JSON
+  // does not define, and the whole generation was discarded after $0.11 of tokens.
+  const authored = { ...blueprint(), system_prompt: "say exactly: 'I am Freya Bank's assistant.'" };
+  const broken = JSON.stringify(authored).replace(/Freya Bank's/, "Freya Bank\\'s");
+  assert.throws(() => JSON.parse(broken));
+  const compiled = compileWorkflow(task, { workflowJson: broken, uncertainties: [] }) as any;
+  assert.equal(compiled.system_prompt, authored.system_prompt);
+
+  // Defined escapes must survive byte for byte.
+  const rich = JSON.stringify({ s: 'a\nb\tc\\d"eé/f' });
+  assert.equal(relaxInvalidEscapes(rich), rich);
+  assert.equal(JSON.parse(relaxInvalidEscapes(rich)).s, 'a\nb\tc\\d"eé/f');
+  // A truncated \u escape is relaxed too, and a trailing backslash is left alone.
+  assert.equal(relaxInvalidEscapes('"\\u12"'), '"u12"');
+  assert.equal(relaxInvalidEscapes('"abc\\'), '"abc\\');
+  // Genuinely broken JSON still fails rather than being silently invented.
+  assert.throws(() => compileWorkflow(task, { workflowJson: '{oops', uncertainties: [] }));
+});
 
 test('API pre-actions expose current tool-named results to downstream state and routing', () => {
   const synthetic: Task = {
@@ -132,6 +158,94 @@ test('compiler binds original OpenAPI schemas without changing sources or accept
   assert.throws(() => compileWorkflow(task, candidate(invalid)), /Unknown bank tool/);
 });
 
+test('final mock URL is applied only at the compiler boundary', () => {
+  const before = structuredClone(task);
+  const workflow = compileWorkflow(task, candidate(blueprint()), {
+    mockUrl: 'https://synthetic-bank.workers.dev',
+  }) as any;
+  assert.equal(
+    workflow.nodes.talk.tools[0].function.parameters.properties.url.default,
+    'https://synthetic-bank.workers.dev/verify_identity',
+  );
+  assert.deepEqual(task, before);
+  assert.throws(
+    () => compileWorkflow(task, candidate(blueprint()), { mockUrl: 'http://unsafe.invalid' }),
+    /Mock URL must be an HTTPS/,
+  );
+});
+
+test('nested request envelopes are reconstructed at the verified API boundary', () => {
+  const bank: Task = {
+    id: 'synthetic-envelope',
+    description: 'Synthetic API envelope; no bank customer data.',
+    tools: [
+      {
+        name: 'list_cards',
+        description: 'List cards.',
+        path: '/voice/v1/cards.list',
+        method: 'POST',
+        url: 'https://example.invalid/voice/v1/cards.list',
+        parameters: {
+          type: 'object',
+          properties: {
+            data: {
+              type: 'object',
+              properties: {
+                customerNo: { type: 'string', default: '{{customerNumber}}' },
+                aiFlow: { type: 'string', default: 'CardOps' },
+              },
+              required: ['customerNo', 'aiFlow'],
+            },
+            call: {
+              type: 'object',
+              properties: {
+                ani: { type: 'string', default: '' },
+                lang: { type: 'string', default: 'tr' },
+              },
+              required: ['ani', 'lang'],
+            },
+          },
+          required: ['data', 'call'],
+        },
+      },
+    ],
+  };
+  const input: any = blueprint();
+  input.nodes.talk.tools = ['list_cards'];
+  const before = structuredClone(bank);
+  const workflow = compileWorkflow(bank, candidate(input), {
+    mockUrl: 'https://synthetic-bank.workers.dev',
+  }) as any;
+  const binding = workflow.nodes.talk.tools[0];
+  const body = binding.function.parameters.properties.body;
+  assert.deepEqual(Object.keys(body.properties), ['customerNo', 'aiFlow']);
+  assert.equal(body.properties.customerNo.default, '{{customerNumber}}');
+  assert.equal(body.properties.aiFlow.default, 'CardOps');
+  assert.equal(
+    binding.function.parameters.properties.url.default,
+    'https://synthetic-bank.workers.dev/voice/v1/cards.list',
+  );
+  const wrapped = JSON.parse(
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        "import json,sys; req=json.load(sys.stdin); config={'body':{'customerNo':'12345678','aiFlow':'CardOps'}}; exec(req['hook'],{'config':config}); print(json.dumps(config['body']))",
+      ],
+      {
+        input: JSON.stringify({ hook: binding.pre_process_code }),
+        encoding: 'utf8',
+        timeout: 2000,
+      },
+    ),
+  );
+  assert.deepEqual(wrapped, {
+    data: { customerNo: '12345678', aiFlow: 'CardOps' },
+    call: { ani: '', lang: 'tr' },
+  });
+  assert.deepEqual(bank, before);
+});
+
 test('compiler takes changed tool fields and allowed values from supplied OpenAPI', () => {
   const changed = structuredClone(openapi);
   changed.paths['/verify_identity'].post.requestBody.content[
@@ -157,6 +271,91 @@ test('compiler rejects dangling routes, nulls and silently discarded action plac
   delete wrong.nodes.talk.pre_actions;
   wrong.nodes.talk.role_message = null;
   assert.throws(() => compileWorkflow(task, candidate(wrong)), /null/);
+});
+
+test('precise-routing asks for narrow exits but does not impose a length ceiling', () => {
+  const input: any = blueprint();
+  input.nodes.talk.transitions = [
+    {
+      target_node: 'done',
+      description: 'End contact or verification',
+      condition: {
+        operator: 'matches_intent',
+        description:
+          'From conversation history: wrong number; customer deceased; still unclear who is speaking after the second ask; third party declines or cannot arrange callback; second invalid callback offer; confirmed customer declines security a second time, asks what the call is about instead of answering a second time, or says twice they do not want to talk; or verification infrastructure failed and cannot be completed.',
+      },
+    },
+    { target_node: 'talk', condition: { operator: 'always' } },
+  ];
+  const before = structuredClone(input);
+  assert.doesNotThrow(() => compileWorkflow(task, candidate(input)));
+  assert.doesNotThrow(() => compileWorkflow(task, candidate(input), { preciseRouting: true }));
+  assert.deepEqual(input, before);
+
+  input.nodes.talk.transitions = [
+    {
+      target_node: 'done',
+      condition: { operator: 'matches_intent', description: 'The caller reports a wrong number.' },
+    },
+    {
+      target_node: 'done',
+      condition: { operator: 'matches_intent', description: 'The customer is deceased.' },
+    },
+    { target_node: 'talk', condition: { operator: 'always' } },
+  ];
+  assert.doesNotThrow(() => compileWorkflow(task, candidate(input), { preciseRouting: true }));
+  input.nodes.talk.transitions[0].condition.description = '';
+  assert.throws(
+    () => compileWorkflow(task, candidate(input), { preciseRouting: true }),
+    /matches_intent needs a nonempty description/,
+  );
+});
+
+test('routing complexity reports the recorded graph shape without rejecting it', () => {
+  // Synthetic shapes based on recorded counts; neither fixture is a benchmark score.
+  const large: any = { nodes: {} };
+  for (let i = 0; i < 59; i += 1) {
+    large.nodes[`stage_${i}`] = {
+      transitions:
+        i === 58
+          ? []
+          : [{ condition: { operator: 'always' } }, { condition: { operator: 'always' } }],
+    };
+  }
+  large.nodes.stage_0.transitions.push(
+    ...Array.from({ length: 13 }, () => ({
+      condition: { operator: 'matches_intent', description: 'A distinct customer signal.' },
+    })),
+  );
+  large.nodes.stage_1.transitions.push(
+    ...Array.from({ length: 13 }, () => ({ condition: { operator: 'always' } })),
+  );
+  assert.deepEqual(routingComplexity(large), {
+    nodes: 59,
+    transitions: 142,
+    maxIntentRoutesPerNode: 13,
+    customRoutingPrompts: 0,
+  });
+  assert.deepEqual(routingSafetyIssues(large), []);
+
+  const compact: any = { nodes: {} };
+  for (let i = 0; i < 12; i += 1) {
+    compact.nodes[`stage_${i}`] = {
+      transitions: i === 11 ? [] : [{ condition: { operator: 'always' } }],
+    };
+  }
+  for (let i = 0; i < 8; i += 1) {
+    compact.nodes[`stage_${i}`].transitions.push({
+      condition: { operator: 'matches_intent', description: 'A specific customer signal.' },
+    });
+  }
+  assert.deepEqual(routingSafetyIssues(compact), []);
+  assert.deepEqual(routingComplexity(compact), {
+    nodes: 12,
+    transitions: 19,
+    maxIntentRoutesPerNode: 1,
+    customRoutingPrompts: 0,
+  });
 });
 
 test('event input preserves original brief and OpenAPI text, with no practice answers', async () => {

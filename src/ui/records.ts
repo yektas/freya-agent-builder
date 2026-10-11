@@ -22,6 +22,8 @@ export type EvaluationView = {
   total: number | null;
   source: string;
   details: string | null;
+  conversationPassed?: number | null;
+  conversationTotal?: number | null;
 };
 
 // Token counts plus the recorded cost estimate. `usd` is null when there was no
@@ -47,6 +49,10 @@ export type TokenUsageView = {
 export type RunSummary = {
   id: string;
   kind: RunKind;
+  /** Stable inspector label such as v1; only generation runs receive one. */
+  name: string | null;
+  /** Human-readable source brief heading, when the recorded task includes it. */
+  briefName: string | null;
   title: string;
   status: string;
   startedAt: string | null;
@@ -118,6 +124,7 @@ export type PracticeView = {
   iterationId: string | null;
   cases: PracticeCaseView[];
   summaryOnly: boolean;
+  conversationPassed: number | null;
 };
 
 export type StageView = {
@@ -158,10 +165,12 @@ export type CandidateView = {
 export type UploadView = {
   status: 'registered' | 'failed' | 'uncertain';
   stage: string;
+  workflowName: string | null;
   slot: string;
   workspaceId: string | null;
   workflowId: string | null;
   agentId: string | null;
+  workflowUrl: string | null;
   version: number | null;
   workflowHash: string | null;
   exportedPath: string | null;
@@ -220,6 +229,8 @@ const GENERATION_FILES = [
   'run.json',
   'trace.jsonl',
   'generation.log',
+  'model-draft.txt',
+  'model-summary.txt',
   'platform.jsonl',
   'exported.workflow.json',
   'upload.json',
@@ -234,6 +245,41 @@ function text(value: unknown): string | null {
 
 function whole(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function briefName(task: Record<string, unknown>, config: Record<string, unknown>): string | null {
+  const recorded = list(task.briefs);
+  const headings = recorded
+    .map((value) => {
+      const brief = record(value);
+      const heading = text(brief.text)
+        ?.split(/\r?\n/)
+        .find((line) => /^#\s+/.test(line))
+        ?.replace(/^#\s+/, '')
+        .trim();
+      if (heading) {
+        return heading;
+      }
+      const path = text(brief.path);
+      return path ? briefLabel(path) : null;
+    })
+    .filter((value): value is string => !!value);
+  if (headings.length) {
+    return headings.join(' + ');
+  }
+
+  const paths = list(config.briefs).filter((value): value is string => typeof value === 'string');
+  const labels = paths.map(briefLabel).filter((value): value is string => !!value);
+  return labels.length ? labels.join(' + ') : null;
+}
+
+function briefLabel(path: string): string | null {
+  const filename = path.split(/[\\/]/).at(-1)?.replace(/\.md$/i, '');
+  if (!filename) {
+    return null;
+  }
+  const match = /^brief-([a-z0-9]+)$/i.exec(filename);
+  return match ? `Brief ${match[1].toUpperCase()}` : filename;
 }
 
 function list(value: unknown): unknown[] {
@@ -438,6 +484,20 @@ function walk(raw: unknown): WorkflowView {
   return view;
 }
 
+/**
+ * True when no case received a reply after the customer spoke. `slowest_turn_s` stays 0
+ * only when no agent message ever followed a customer turn, so a run that is entirely
+ * zeroes measured a silent agent model rather than a weak agent. Such a run is recorded
+ * as unmeasured so it is never read as a 0/N builder score.
+ */
+export function silentPracticeRun(raw: unknown): boolean {
+  const rows = list(record(raw).rows).map(record);
+  const measured = rows.filter(
+    (row) => row.slowest_turn_s === 0 && row.ended === 'customer-ended-call',
+  );
+  return measured.length >= 2 && measured.length === rows.length;
+}
+
 function practiceView(raw: unknown): PracticeView | null {
   const result = record(raw);
   const rows = list(result.rows);
@@ -447,6 +507,8 @@ function practiceView(raw: unknown): PracticeView | null {
     return null;
   }
   const finalRows = list(result.final);
+  const repetitions = whole(result.runs) ?? 1;
+  const attempts = list(result.all_rows);
   const cases: PracticeCaseView[] = rows.map((item) => {
     const row = record(item);
     const final = finalRows.map(record).find((entry) => entry.id === row.id);
@@ -476,31 +538,56 @@ function practiceView(raw: unknown): PracticeView | null {
     iterationId: text(result.iteration_id),
     cases,
     summaryOnly: !cases.length,
+    // The kit adds a conversation failure for every non-pass judge verdict.
+    // Only infer its separate count from complete kit rows, never summary-only data.
+    conversationPassed:
+      cases.length === total &&
+      text(result.simulation_id) &&
+      text(result.iteration_id) &&
+      rows.every(
+        (item) =>
+          object(item) &&
+          typeof item.pass === 'boolean' &&
+          Array.isArray(item.failed) &&
+          typeof item.call_id === 'string',
+      ) &&
+      (repetitions === 1 ||
+        (attempts.length === repetitions &&
+          attempts.every((items) => Array.isArray(items) && items.length === cases.length)))
+        ? cases.filter((item) => !item.failed.some((reason) => reason.startsWith('conversation:')))
+            .length
+        : null,
   };
 }
 
 function traceView(entries: unknown[]): TraceEntryView[] {
   const out: TraceEntryView[] = [];
+  const streams = new Map<string, TraceEntryView>();
+  const hasProgress = entries.some((item) => record(item).kind === 'progress');
+  let lastHeartbeat = 0;
   for (const item of entries) {
     const entry = record(item);
     const data = entry.data;
     const model = entry.kind === 'model-event' ? record(data) : {};
     const streamKind = model.kind === 'draft' || model.kind === 'summary' ? model.kind : undefined;
     if (streamKind && typeof model.text === 'string') {
-      const last = out.at(-1);
-      if (last?.streamKind === streamKind) {
-        last.summary += model.text;
+      const last = streams.get(streamKind);
+      if (last) {
         last.fragments = (last.fragments ?? 1) + 1;
+        last.elapsedMs = whole(entry.elapsedMs);
         last.endedElapsedMs = whole(entry.elapsedMs);
+        // Count legacy fragments without sending their escaped contents to the UI.
+        const chars = Number(last.summary.split(' ')[0]) + model.text.length;
+        last.summary = `${chars} characters received`;
       } else {
-        out.push({
+        streams.set(streamKind, {
           at: text(entry.at),
           elapsedMs: whole(entry.elapsedMs),
           endedElapsedMs: whole(entry.elapsedMs),
-          kind: 'model-event',
+          kind: 'model-output',
           streamKind,
           fragments: 1,
-          summary: `${streamKind}: ${model.text}`,
+          summary: `${model.text.length} characters received`,
         });
       }
       continue;
@@ -509,15 +596,60 @@ function traceView(entries: unknown[]): TraceEntryView[] {
     if (typeof data === 'string') {
       summary = data;
     } else if (entry.kind === 'progress') {
-      summary = text(record(data).message) ?? '';
+      summary = (text(record(data).message) ?? '').replace(/^\[generate \+[^\]]+\]\s*/, '').trim();
+      if (summary.startsWith('Node ')) {
+        continue;
+      }
+      if (summary.startsWith('Waiting for model completion')) {
+        const elapsed = whole(entry.elapsedMs);
+        if (elapsed !== null && elapsed - lastHeartbeat < 30000) {
+          continue;
+        }
+        lastHeartbeat = elapsed ?? lastHeartbeat;
+      }
     } else if (entry.kind === 'model-event') {
-      summary = [model.kind, text(model.text), text(model.reason), compact(model.usage)]
+      if (hasProgress && ['accepted', 'reasoning', 'completed'].includes(String(model.kind))) {
+        continue;
+      }
+      const usage = normalizeUsage(model.usage);
+      summary = [
+        model.kind,
+        text(model.reason),
+        hasUsage(usage)
+          ? `${usage.inputTokens} input tokens · ${usage.outputTokens} output tokens`
+          : null,
+      ]
         .filter(Boolean)
         .join(': ');
+    } else if (entry.kind === 'model-stream-started' || entry.kind === 'model-stream-ended') {
+      const stream = record(data);
+      summary = `${stream.kind === 'draft' ? 'Workflow draft' : 'Model summary'}: ${
+        entry.kind === 'model-stream-started'
+          ? 'receiving output'
+          : `${whole(stream.chars) ?? 0} characters received`
+      }. Saved in ${text(stream.artifact) ?? 'Files'}.`;
+    } else if (String(entry.kind).startsWith('model-call-')) {
+      const call = record(data);
+      if (entry.kind === 'model-call-started' && out.at(-1)?.kind === entry.kind) {
+        continue;
+      }
+      summary = [
+        'Responses API',
+        whole(call.elapsedMs) !== null
+          ? `${((whole(call.elapsedMs) ?? 0) / 1000).toFixed(1)}s`
+          : '',
+        text(call.error),
+        'Request and response in run.json',
+      ]
+        .filter(Boolean)
+        .join(' · ');
     } else if (entry.kind === 'error') {
       summary = text(record(data).message) ?? '';
     } else if (entry.kind === 'start' || entry.kind === 'end') {
-      summary = '';
+      summary =
+        entry.kind === 'start'
+          ? 'Generation started'
+          : `Generation ${text(record(data).status) ?? 'ended'}`;
     } else {
       summary = compact(data) ?? '';
     }
@@ -528,7 +660,7 @@ function traceView(entries: unknown[]): TraceEntryView[] {
       summary: summary.length > 4000 ? `${summary.slice(0, 4000)}…` : summary,
     });
   }
-  return out;
+  return [...out, ...streams.values()].sort((a, b) => (a.elapsedMs ?? 0) - (b.elapsedMs ?? 0));
 }
 
 function stageView(raw: unknown): StageView[] {
@@ -571,10 +703,12 @@ function uploadView(raw: unknown): UploadView | null {
     status:
       status === 'registered' || status === 'uncertain' || status === 'failed' ? status : 'failed',
     stage: String(raw.stage ?? 'unknown'),
+    workflowName: text(raw.workflowName),
     slot: String(raw.slot),
     workspaceId: text(raw.workspaceId),
     workflowId: text(raw.workflowId),
     agentId: text(raw.agentId),
+    workflowUrl: text(raw.workflowUrl),
     version: whole(raw.version),
     workflowHash: text(raw.workflowHash),
     exportedPath: text(raw.exportedPath),
@@ -642,12 +776,15 @@ function summarize(
       : object(errorValue)
         ? text(record(errorValue).message)
         : text(build.error);
+  const name = kind === 'generation-only' ? text(config.runName) : null;
   const title =
-    text(config.slot) ?? text(task.id) ?? text(record(run.runId)) ?? text(run.runId) ?? id;
+    name ?? text(config.slot) ?? text(task.id) ?? text(record(run.runId)) ?? text(run.runId) ?? id;
   const model = text(config.model) ?? text(run.model);
   const summary: RunSummary = {
     id,
     kind,
+    name,
+    briefName: briefName(task, config),
     title,
     status: String(run.status ?? build.status ?? 'unknown'),
     startedAt: text(run.startedAt) ?? text(run.createdAt),
@@ -939,12 +1076,9 @@ export async function listRuns(root: string): Promise<RunSummary[]> {
   return listRunsDetailed(root).then((all) => all.map((item) => item.summary));
 }
 
-// Detail plus archive flag: the archive filter needs to know, and the route
-// needs to split the answer.
-export async function listRunsDetailed(
-  root: string,
+async function summarizeStatuses(
+  statuses: RunStatus[],
 ): Promise<{ summary: RunSummary; archived: boolean }[]> {
-  const statuses = await scan(root);
   const summaries = await Promise.all(
     statuses.map(async (item) => {
       const { summary } = await summarize(
@@ -958,10 +1092,52 @@ export async function listRunsDetailed(
       return { summary, archived: item.archived };
     }),
   );
+
+  // Old generation records predate version labels. Assign them once in
+  // chronological order while keeping any labels already saved in run.json.
+  const generations = summaries
+    .map((item) => item.summary)
+    .filter((summary) => summary.kind === 'generation-only');
+  const used = new Set<number>();
+  for (const summary of generations) {
+    const version = /^v([1-9]\d*)$/.exec(summary.name ?? '');
+    if (version) {
+      used.add(Number(version[1]));
+    }
+  }
+  const legacy = generations
+    .filter((summary) => !summary.name)
+    .sort(
+      (a, b) =>
+        (Date.parse(a.startedAt ?? '') || 0) - (Date.parse(b.startedAt ?? '') || 0) ||
+        a.id.localeCompare(b.id),
+    );
+  let candidate = 1;
+  for (const summary of legacy) {
+    while (used.has(candidate)) {
+      candidate++;
+    }
+    summary.name = `v${candidate}`;
+    used.add(candidate++);
+  }
+  for (const summary of generations) {
+    if (summary.name) {
+      summary.title = summary.name;
+    }
+  }
+
   return summaries.sort(
     (a, b) =>
       (Date.parse(b.summary.startedAt ?? '') || 0) - (Date.parse(a.summary.startedAt ?? '') || 0),
   );
+}
+
+// Detail plus archive flag: the archive filter needs to know, and the route
+// needs to split the answer.
+export async function listRunsDetailed(
+  root: string,
+): Promise<{ summary: RunSummary; archived: boolean }[]> {
+  return summarizeStatuses(await scan(root));
 }
 
 async function practiceBusy(run: DiscoveredRun): Promise<boolean> {
@@ -996,25 +1172,30 @@ async function attachPractice(
     current && job.status === 'completed'
       ? practiceView(await readJson(run.filePaths['practice.json']))
       : null;
+  const silent = result && silentPracticeRun(await readJson(run.filePaths['practice.json']));
   summary.evaluation =
-    result && result.total > 0
+    result && result.total > 0 && !silent
       ? {
           score: result.passed / result.total,
           passed: result.passed,
           total: result.total,
           source: 'official-practice',
-          details: `${job.brief === 'all' ? 'A+B' : job.brief} practice; ${job.repetitions} repetition(s); ${job.style ?? 'normal'} speech. Public cases, not the hidden final benchmark.`,
+          conversationPassed: result.conversationPassed,
+          conversationTotal: result.conversationPassed === null ? null : result.total,
+          details: `Kit score requires bank ledger and conversation checks to pass in every repetition. ${job.brief === 'all' ? 'A+B' : job.brief} practice; ${job.repetitions} repetition(s); ${job.style ?? 'normal'} speech. Public cases, not the hidden final benchmark.`,
         }
       : {
           score: null,
           passed: null,
           total: null,
           source: 'not-evaluated',
-          details: !current
-            ? 'Registration changed since testing; test the current upload again.'
-            : job.status === 'running'
-              ? 'Practice testing is running.'
-              : 'The latest practice attempt failed; previous results remain in practice-history.json.',
+          details: silent
+            ? 'No case received a reply after the customer spoke, so this run measured the agent model rather than the agent. Not a score; repeat the test when the model responds.'
+            : !current
+              ? 'Registration changed since testing; test the current upload again.'
+              : job.status === 'running'
+                ? 'Practice testing is running.'
+                : 'The latest practice attempt failed; previous results remain in practice-history.json.',
         };
   return job as unknown as PracticeJob;
 }
@@ -1033,17 +1214,15 @@ async function loadWorkflow(run: DiscoveredRun) {
 }
 
 export async function loadRun(root: string, id: string): Promise<RunDetail | null> {
-  const runs = await discoverRuns(root);
-  const run = runs.find((item) => item.id === id);
-  if (!run) {
+  const statuses = await scan(root);
+  const status = statuses.find((item) => item.run.id === id);
+  if (!status) {
     return null;
   }
-  const { summary, parsed } = await summarize(
-    run.id,
-    run.kind,
-    await readJson(run.runFile),
-    run.files,
-  );
+  const run = status.run;
+  const summaries = await summarizeStatuses(statuses);
+  const summary = summaries.find((item) => item.summary.id === id)!.summary;
+  const parsed = record(await readJson(run.runFile));
   const workflow = await loadWorkflow(run);
   const practiceJob = await attachPractice(run, summary);
   const practiceFile =

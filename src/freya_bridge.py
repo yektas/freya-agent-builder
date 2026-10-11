@@ -75,6 +75,12 @@ freya.api = traced_api
 
 def main():
     action = request['action']
+    if action == 'recover-practice':
+        from practice_recovery import recover_practice
+        runner = importlib.import_module('run_cases')
+        result = recover_practice(request, freya, runner, log)
+        pathlib.Path(request['path']).write_text(json.dumps(clean(result), indent=2) + '\n')
+        return result
     if action == 'probe':
         items = freya.api('GET', '/api/v2/workspaces')['workspaces']
         desired = os.environ.get('FREYA_WORKSPACE_ID')
@@ -83,9 +89,10 @@ def main():
             raise RuntimeError('Set FREYA_WORKSPACE_ID to one accessible workspace; automatic selection requires exactly one workspace')
         return {'workspaceId': matches[0]['id'], 'name': matches[0].get('name'), 'agentLlm': freya.AGENT_LLM}
     if action == 'validate':
-        return freya.validate_workflow(request['slot'], request['workflow'])
+        return freya.validate_workflow(request.get('workflowName', request['slot']), request['workflow'])
     if action == 'register':
-        # The organizer helper reuses the slot and publishes updates. No automatic retry on create.
+        # Preserve the organizer helper's slot/update semantics while giving a
+        # newly created workflow a useful name independent of its state key.
         state_path = pathlib.Path(request['stateFile'])
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
         pending = state_path.with_name(state_path.name + '.' + request['slot'] + '.pending')
@@ -97,7 +104,14 @@ def main():
             # Keep this marker on failure so a later run cannot silently create a duplicate.
             with pending.open('x') as out:
                 json.dump({'slot': request['slot'], 'trace': request['trace']}, out)
-        result = freya.save_workflow(request['slot'], request['workflow'], request['stateFile'])
+        if creating:
+            state[request['slot']] = freya.create_workflow(
+                request.get('workflowName', request['slot']), request['workflow'])
+        else:
+            state[request['slot']]['version'] = freya.update_workflow(
+                state[request['slot']]['workflow_id'], request['workflow'])
+        state_path.write_text(json.dumps(state, indent=1))
+        result = state[request['slot']]
         if creating:
             pending.unlink()
         return result
@@ -111,14 +125,29 @@ def main():
     if action == 'practice':
         runner = importlib.import_module('run_cases')
         original_simulation = freya.run_simulation
+        original_iteration = freya.get_iteration
+        scored_iterations = {}
+
+        def scored_iteration(sim_id, it_id):
+            return scored_iterations.get((sim_id, it_id)) or original_iteration(sim_id, it_id)
 
         def completed_simulation(*args, **kwargs):
             result = original_simulation(*args, **kwargs)
             if result[2] != 'completed':
                 raise RuntimeError('Practice simulation did not complete: ' + str(result[2]))
+            # A completed summary can arrive before detailed judge verdicts.
+            # Missing verdicts are missing evidence, not ten failed customers.
+            iteration = original_iteration(result[0], result[1])
+            rows = iteration.get('runs', [])
+            variables = args[2] if len(args) > 2 else kwargs['variables_by_persona']
+            if (len(rows) != len(variables) or {r.get('personaId') for r in rows} != set(variables)
+                    or any(r.get('outcome') not in ('pass', 'fail') for r in rows)):
+                raise RuntimeError('Completed simulation has incomplete judge verdicts; no score recorded')
+            scored_iterations[(result[0], result[1])] = iteration
             return result
 
         freya.run_simulation = completed_simulation
+        freya.get_iteration = scored_iteration
         cache = pathlib.Path(request['cacheDir'])
         cache.mkdir(parents=True, exist_ok=True)
         runner.ROOT = cache
@@ -142,9 +171,39 @@ def main():
         runner.main()
         path = pathlib.Path(request['path'])
         data = clean(json.loads(path.read_text()))
+        dead = silent_run(data)
+        if dead:
+            # The phone agent never produced a reply after a customer turn in any case,
+            # so nothing about the agent was measured. Drop the runner's own 0/N output
+            # and record the infrastructure failure instead of a score the builder would
+            # then be judged against.
+            path.unlink(missing_ok=True)
+            raise RuntimeError(dead)
         path.write_text(json.dumps(data, indent=2) + '\n')
         return data
     raise RuntimeError('Unknown bridge action')
+
+
+def silent_run(data):
+    """Describe a run in which the agent never answered, or None when it spoke.
+
+    `slowest_turn_s` is the longest gap between a customer message and the agent's next
+    one, so it stays 0 only when no agent message ever followed a customer turn. A run
+    where every case looks like that is a dead platform model, not a weak agent.
+    """
+    rows = data.get('rows') if isinstance(data, dict) else None
+    measured = [r for r in rows if isinstance(r, dict) and 'slowest_turn_s' in r] if isinstance(rows, list) else []
+    if len(measured) < 2:
+        return None
+    if all(r.get('slowest_turn_s') == 0 for r in measured) and all(
+        r.get('ended') == 'customer-ended-call' for r in measured
+    ):
+        return (
+            'No case received a reply after the customer spoke, so the run measured the '
+            'platform model rather than the agent. The agent model did not answer; this is '
+            'not a score. Repeat the test once the agent model responds.'
+        )
+    return None
 
 
 class SafeProgress:

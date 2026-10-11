@@ -9,7 +9,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { archiveRun, deleteRun, listRuns, loadRun, readRunFile, restoreRun } from './records.ts';
-import { UploadError, uploadAvailability, uploadRun, workflowConsole } from './upload.ts';
+import { resolveWorkflowUrl, UploadError, uploadAvailability, uploadRun } from './upload.ts';
 import type { UploadOptions } from './upload.ts';
 import { GenerateError, generationAvailability, startGeneration } from './generate.ts';
 import type { GenerationOptions } from './generate.ts';
@@ -132,21 +132,15 @@ async function route(options: UiOptions, url: URL, response: ServerResponse) {
     return;
   }
   if (path === '/api/upload') {
-    // Whether the action can run, and why not. Never any credential. The
-    // console origin rides along, so the UI can link to a registered workflow
-    // without the server learning anything per-request.
+    // Whether the action can run, and why. Never any credential or URL
+    // template; the upload response contains only the resolved workflow URL.
     const availability = options.upload
       ? await uploadAvailability(options.upload)
       : {
           available: false,
           problem: 'This inspector was started without upload configuration.',
         };
-    const console = workflowConsole(options.upload?.env ?? process.env);
-    sendJson(response, 200, {
-      ...availability,
-      consoleUrl: console.consoleUrl,
-      exact: console.exact,
-    });
+    sendJson(response, 200, availability);
     return;
   }
   if (path === '/api/generate') {
@@ -170,6 +164,17 @@ async function route(options: UiOptions, url: URL, response: ServerResponse) {
   const run = /^\/api\/runs\/([^/]+)$/.exec(path);
   if (run) {
     const detail = await loadRun(root, run[1]);
+    // Older upload records predate persisted deep links. Resolve the URL while
+    // serving detail so a refresh makes those existing registrations clickable
+    // without changing their recorded artifacts or contacting Freya.
+    if (detail?.upload?.status === 'registered' && !detail.upload.workflowUrl) {
+      detail.upload.workflowUrl = resolveWorkflowUrl(
+        options.upload?.env ?? process.env,
+        detail.upload.workflowId,
+        detail.upload.workspaceId,
+        detail.upload.agentId,
+      );
+    }
     sendJson(response, detail ? 200 : 404, detail ?? { error: 'Unknown run.' });
     return;
   }

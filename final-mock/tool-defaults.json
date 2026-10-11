@@ -1,0 +1,23 @@
+{
+  "cards.list": { "customerNo": "{{customerNumber}}", "aiFlow": "CardOps" },
+  "cards.balance": { "cardNumber": "{{selected_card_number}}" },
+  "statement.week.get": { "cardNumber": "{{selected_card_number}}" },
+  "statement.week.decide": {
+    "cardNumber": "{{selected_card_number}}",
+    "newStatementWeek": "{{selected_statement_week}}",
+    "statementDay": "{{current_statement_day}}"
+  },
+  "statement.week.change": {
+    "cardNumber": "{{selected_card_number}}",
+    "newStatementWeek": "{{selected_statement_week}}",
+    "statementDay": "{{current_statement_day}}"
+  },
+  "contact.email.get": { "customerNo": "{{customerNumber}}", "intAddressInfoType": "E" },
+  "statement.pdf.send": {
+    "customerNo": "{{customerNumber}}",
+    "cardNumber": "{{selected_card_number}}",
+    "currencyType": "{{selected_currency}}",
+    "statementDate": "{{issued_statement_date}}",
+    "emailAddress": "{{registered_email}}"
+  }
+}

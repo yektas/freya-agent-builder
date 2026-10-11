@@ -1,9 +1,12 @@
-// Prepare a submission from two completed final runs. No model or platform calls.
+// Prepare a submission from one completed final run. No model or platform calls.
 import { execFileSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { hash, projectRoot } from './experiments.ts';
 import { object } from './validation.ts';
+import { parseFreyaStrategy } from './strategies.ts';
+
+type Member = { name: string; email: string };
 
 function rejectSecrets(value: unknown) {
   const secrets = ['OPENAI_API_KEY', 'FREYA_API_KEY', 'FREYA_BANK_TEAM_KEY']
@@ -55,19 +58,59 @@ function usedBankTools(workflow: unknown, catalog: { name: string }[]) {
   return [...used].sort();
 }
 
+function boundToolUrls(workflow: unknown): string[] {
+  const urls: string[] = [];
+  function visit(value: unknown): void {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+    } else if (object(value)) {
+      if (object(value.function) && value.function.handler === '__function__:api_call') {
+        const parameters = value.function.parameters;
+        const url =
+          object(parameters) && object(parameters.properties) && parameters.properties.url;
+        if (!object(url) || typeof url.default !== 'string') {
+          throw new Error('Export has a bank tool without a bound URL.');
+        }
+        urls.push(url.default);
+      }
+      Object.values(value).forEach(visit);
+    }
+  }
+  visit(workflow);
+  return urls;
+}
+
 export async function prepareSubmission(
   options: {
     runs: string[];
     out: string;
     team: string;
+    members: Member[];
     repo: string;
     commit: string;
+    mockUrl: string;
+    runCommand: string;
   },
   repository = projectRoot,
 ) {
-  if (options.runs.length !== 2 || !options.team.trim() || !options.repo.startsWith('https://')) {
+  const mock = new URL(options.mockUrl);
+  if (
+    options.runs.length !== 1 ||
+    !options.team.trim() ||
+    !options.repo.startsWith('https://') ||
+    options.members.length < 1 ||
+    options.members.length > 2 ||
+    options.members.some((member) => !member.name.trim() || !/^\S+@\S+\.\S+$/.test(member.email)) ||
+    mock.protocol !== 'https:' ||
+    !!mock.username ||
+    !!mock.password ||
+    !!mock.search ||
+    !!mock.hash ||
+    !options.runCommand.includes('{case_folder}') ||
+    !options.runCommand.includes('{mock_url}')
+  ) {
     throw new Error(
-      'Submission needs two final run files, a team name, and an HTTPS repository URL.',
+      'Submission needs one final run, one or two members, a team name, HTTPS repository and mock URLs, and a run command with {case_folder} and {mock_url}.',
     );
   }
   const git = (...args: string[]) =>
@@ -80,8 +123,9 @@ export async function prepareSubmission(
     throw new Error('Use a Git commit SHA.');
   }
   const commit = git('rev-parse', `${options.commit}^{commit}`).trim();
+  const mockBase = mock.toString().replace(/\/$/, '');
   const prepared = [];
-  for (const [index, file] of options.runs.entries()) {
+  for (const file of options.runs) {
     const run = JSON.parse(await readFile(resolve(file), 'utf8'));
     if (
       run.kind !== 'freya-live-run' ||
@@ -90,9 +134,13 @@ export async function prepareSubmission(
       run.source?.git?.dirty !== false ||
       !run.source?.git?.commit ||
       !object(run.source?.files) ||
-      run.source.hash !== hash(run.source.files)
+      run.source.hash !== hash(run.source.files) ||
+      run.config?.mockUrl?.replace(/\/$/, '') !== mockBase ||
+      !Array.isArray(run.task?.tools)
     ) {
-      throw new Error('Select completed final runs built from the same clean submitted commit.');
+      throw new Error(
+        'Select a completed final run built from the clean submitted commit and bound to this mock URL.',
+      );
     }
     for (const [name, text] of Object.entries(run.source.files)) {
       if (typeof text !== 'string' || git('show', `${commit}:${name}`) !== text) {
@@ -126,8 +174,19 @@ export async function prepareSubmission(
     ) {
       throw new Error('Export changed or does not match the recorded registration.');
     }
+    const urls = boundToolUrls(exported.workflow);
+    if (!urls.length || urls.some((url) => !url.startsWith(`${mockBase}/`))) {
+      throw new Error('Exported bank tools must all call the selected mock URL.');
+    }
     rejectSecrets(exported);
-    const name = `hidden-${index + 1}`;
+    const strategy = parseFreyaStrategy(run.config.strategy ?? 'direct');
+    const instructionsHash = run.config.instructionsHash ?? null;
+    if (
+      (instructionsHash !== null && !/^[a-f0-9]{64}$/.test(instructionsHash)) ||
+      (strategy !== 'direct' && instructionsHash === null)
+    ) {
+      throw new Error('Final run is missing a valid builder instructions hash.');
+    }
     const trace = {
       startedAt: run.startedAt,
       endedAt: run.endedAt,
@@ -148,6 +207,8 @@ export async function prepareSubmission(
       toolNames: usedBankTools(run.workflow, run.task.tools),
       model: run.config.model,
       reasoningEffort: run.config.reasoningEffort ?? null,
+      strategy,
+      instructionsHash,
       sourceFiles: run.source.files,
       exportHash: run.exportHash,
       stages: run.stages,
@@ -155,18 +216,7 @@ export async function prepareSubmission(
       tests: run.practice ?? null,
     };
     rejectSecrets(trace);
-    prepared.push({ name, exportText, trace });
-  }
-  if (
-    prepared[0].trace.model !== prepared[1].trace.model ||
-    prepared[0].trace.reasoningEffort !== prepared[1].trace.reasoningEffort
-  ) {
-    throw new Error(
-      'Both final runs must use the same model and reasoning settings for the run command.',
-    );
-  }
-  if (prepared[0].trace.inputHash === prepared[1].trace.inputHash) {
-    throw new Error('Select one distinct input run for each hidden brief.');
+    prepared.push({ exportText, trace });
   }
   if (
     isAbsolute(options.out) ||
@@ -175,35 +225,31 @@ export async function prepareSubmission(
   ) {
     throw new Error('Use a repository-relative submission directory outside experiments.');
   }
+  const item = prepared[0];
+  const workflow = `${options.out}/final.workflow.json`;
+  const trace = `${options.out}/final.trace.json`;
+  const form = {
+    team: options.team,
+    members: options.members,
+    repo: options.repo,
+    commit: null,
+    run_command: options.runCommand,
+    workflow,
+    trace,
+    mock_url: mockBase,
+  };
+  rejectSecrets(form);
   const directory = resolve(repository, options.out);
   // Refuse existing output. This keeps earlier selected artifacts intact.
   await mkdir(directory, { recursive: false });
-  const workflows: Record<string, string> = {};
-  const traces: Record<string, string> = {};
-  for (const item of prepared) {
-    workflows[item.name] = `${options.out}/${item.name}.workflow.json`;
-    traces[item.name] = `${options.out}/${item.name}.trace.json`;
-    await writeFile(join(directory, `${item.name}.workflow.json`), item.exportText, {
-      flag: 'wx',
-      mode: 0o600,
-    });
-    await writeFile(
-      join(directory, `${item.name}.trace.json`),
-      JSON.stringify(item.trace, null, 2) + '\n',
-      { flag: 'wx', mode: 0o600 },
-    );
-  }
-  const quote = (value: string) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
-  const strategy = prepared[0].trace;
-  const form = {
-    team: options.team,
-    repo: options.repo,
-    commit: null,
-    builder_commit: commit,
-    run_command: `node --env-file-if-exists=.env --env-file-if-exists=build-the-builder/env.sh src/cli.ts freya --final --brief-file {brief_path} --openapi {tool_api_path} --slot final --model ${quote(strategy.model)} --reasoning-effort ${quote(strategy.reasoningEffort ?? '')}`,
-    workflows,
-    traces,
-  };
+  await writeFile(join(directory, 'final.workflow.json'), item.exportText, {
+    flag: 'wx',
+    mode: 0o600,
+  });
+  await writeFile(join(directory, 'final.trace.json'), JSON.stringify(item.trace, null, 2) + '\n', {
+    flag: 'wx',
+    mode: 0o600,
+  });
   await writeFile(join(directory, 'submission.json'), JSON.stringify(form, null, 2) + '\n', {
     flag: 'wx',
     mode: 0o600,
@@ -225,37 +271,34 @@ export async function finalizeSubmission(out: string, commitRef: string, reposit
   const commit = git('rev-parse', `${commitRef}^{commit}`).trim();
   const path = resolve(repository, out, 'submission.json');
   const form = JSON.parse(await readFile(path, 'utf8'));
-  for (const name of ['hidden-1', 'hidden-2']) {
-    for (const file of [form.workflows[name], form.traces[name]]) {
-      if (typeof file !== 'string' || isAbsolute(file) || file.split(/[\\/]/).includes('..')) {
-        throw new Error('Submission paths must be inside the repository.');
-      }
-      if (
-        git('show', `${commit}:${file}`) !== (await readFile(resolve(repository, file), 'utf8'))
-      ) {
-        throw new Error(`Submission file differs from commit: ${file}`);
-      }
+  rejectSecrets(form);
+  for (const file of [form.workflow, form.trace]) {
+    if (typeof file !== 'string' || isAbsolute(file) || file.split(/[\\/]/).includes('..')) {
+      throw new Error('Submission paths must be inside the repository.');
     }
-    const trace = JSON.parse(await readFile(resolve(repository, form.traces[name]), 'utf8'));
-    if (hash(trace.sourceFiles) !== trace.sourceHash) {
-      throw new Error('Trace source hash changed.');
+    if (git('show', `${commit}:${file}`) !== (await readFile(resolve(repository, file), 'utf8'))) {
+      throw new Error(`Submission file differs from commit: ${file}`);
     }
-    for (const [name, text] of Object.entries(trace.sourceFiles)) {
-      if (git('show', `${commit}:${name}`) !== text) {
-        throw new Error(`Submitted builder differs from run: ${name}`);
-      }
-    }
-    const exported = JSON.parse(await readFile(resolve(repository, form.workflows[name]), 'utf8'));
-    if (
-      hash(exported) !== trace.exportHash ||
-      exported.workflow_id !== trace.registration.workflow_id ||
-      exported.agent_id !== trace.registration.agent_id
-    ) {
-      throw new Error('Submitted export does not match its trace.');
-    }
-    rejectSecrets(trace);
-    rejectSecrets(exported);
   }
+  const trace = JSON.parse(await readFile(resolve(repository, form.trace), 'utf8'));
+  if (hash(trace.sourceFiles) !== trace.sourceHash) {
+    throw new Error('Trace source hash changed.');
+  }
+  for (const [name, text] of Object.entries(trace.sourceFiles)) {
+    if (git('show', `${commit}:${name}`) !== text) {
+      throw new Error(`Submitted builder differs from run: ${name}`);
+    }
+  }
+  const exported = JSON.parse(await readFile(resolve(repository, form.workflow), 'utf8'));
+  if (
+    hash(exported) !== trace.exportHash ||
+    exported.workflow_id !== trace.registration.workflow_id ||
+    exported.agent_id !== trace.registration.agent_id
+  ) {
+    throw new Error('Submitted export does not match its trace.');
+  }
+  rejectSecrets(trace);
+  rejectSecrets(exported);
   form.commit = commit;
   await writeFile(path, JSON.stringify(form, null, 2) + '\n', { mode: 0o600 });
   return form;

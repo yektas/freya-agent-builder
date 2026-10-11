@@ -66,7 +66,7 @@ export function generationProgress(
           report(
             `Waiting for model completion; ${outputChars.toLocaleString('en-US')} draft characters received.`,
           ),
-        10000,
+        30000,
       );
       heartbeat.unref();
     },

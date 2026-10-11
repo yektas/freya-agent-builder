@@ -10,4 +10,5 @@ coverage/
 *.log
 *.tsbuildinfo
 __pycache__/
+.impeccable/
 /build-the-builder/

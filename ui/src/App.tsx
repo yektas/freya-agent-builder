@@ -1,10 +1,9 @@
 import * as React from 'react';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Archive as ArchiveIcon, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { NewRunAction } from '@/components/new-run-action';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { TooltipProvider } from '@/components/ui/tooltip';
-import { SidebarProvider } from '@/components/ui/sidebar';
-import { RunList } from '@/components/run-list';
 import { RunTable } from '@/components/run-table';
 import { OverviewTab } from '@/components/overview-tab';
 import { PracticeTab } from '@/components/practice-tab';
@@ -13,7 +12,6 @@ import { CandidateTab, FilesTab, TraceTab } from '@/components/simple-tabs';
 import { UploadAction } from '@/components/upload-action';
 import { PracticeAction } from '@/components/practice-action';
 import { RowAction } from '@/components/delete-run';
-import { Archive as ArchiveIcon } from 'lucide-react';
 import { isRunning, kindLabel, when } from '@/lib/data';
 import type { RunDetail, RunSummary, StartedRun } from '@/lib/data';
 import { usePoller } from '@/lib/hooks';
@@ -70,52 +68,57 @@ function Detail({
   ];
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <header className="border-b border-border px-5 pt-3.5">
-        <div className="flex items-start gap-4">
-          <div className="min-w-0 flex-1">
-            <h2 className="truncate text-[17px] font-semibold tracking-tight">{s.title}</h2>
-            <p className="mt-0.5 truncate font-mono text-[11.5px] text-muted-foreground">
-              {when(s.startedAt)} · {kindLabel(s.kind)}
-              {s.model ? ` · ${s.model}` : ''}
-              {isRunning(s) && <span className="text-warning"> · updating live</span>}
-            </p>
+    <div className="detail-view flex min-h-0 flex-1 flex-col">
+      <header className="detail-header border-b border-border">
+        <div className="detail-header-inner">
+          <div className="detail-title-row">
+            <Button variant="ghost" size="sm" onClick={onBack} className="detail-back">
+              <ArrowLeft className="size-3.5" />
+              All runs
+            </Button>
+            <span className="detail-title-divider" aria-hidden="true" />
+            <div className="min-w-0 flex-1">
+              <h1 className="truncate text-[21px] font-semibold tracking-tight">{s.title}</h1>
+              <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+                {when(s.startedAt)} · {kindLabel(s.kind)}
+                {s.model ? ` · ${s.model}` : ''}
+                {isRunning(s) && <span className="text-warning"> · updating live</span>}
+              </p>
+            </div>
+            <RowAction
+              id={s.id}
+              archived={s.archived}
+              disabled={isRunning(s)}
+              onArchived={onArchived}
+              onRestored={onRestored}
+            />
+            {s.archived && (
+              <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                <ArchiveIcon className="size-3" /> archived — restorable
+              </span>
+            )}
           </div>
-          <Button variant="outline" size="sm" onClick={onBack}>
-            <ArrowLeft className="size-3.5" />
-            All runs
-          </Button>
-          <RowAction
-            id={s.id}
-            archived={s.archived}
-            disabled={isRunning(s)}
-            onArchived={onArchived}
-            onRestored={onRestored}
-          />
-          {s.archived && (
-            <span className="mt-1 inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              <ArchiveIcon className="size-3" /> archived — restorable
-            </span>
-          )}
+          {/* Remount per run so a pending request or result never leaks across runs. */}
+          <div className="detail-actions">
+            <UploadAction key={detail.summary.id} detail={detail} />
+            <PracticeAction key={`practice-${detail.summary.id}`} detail={detail} />
+          </div>
+          <Tabs value={tab} onValueChange={setTab}>
+            <TabsList className="detail-tabs mt-3 h-auto gap-1 bg-transparent p-0">
+              {tabs.map(([value, label]) => (
+                <TabsTrigger
+                  key={value}
+                  value={value}
+                  className="rounded-md border border-transparent bg-transparent px-3 py-2 text-xs text-muted-foreground data-[selected]:border-border data-[selected]:bg-card data-[selected]:font-medium data-[selected]:text-foreground"
+                >
+                  {label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
         </div>
-        {/* Remount per run so a pending request or result never leaks across runs. */}
-        <UploadAction key={detail.summary.id} detail={detail} />
-        <PracticeAction key={`practice-${detail.summary.id}`} detail={detail} />
-        <Tabs value={tab} onValueChange={setTab}>
-          <TabsList className="mt-3 h-auto gap-0.5 bg-transparent p-0">
-            {tabs.map(([value, label]) => (
-              <TabsTrigger
-                key={value}
-                value={value}
-                className="rounded-t-md border-b-2 border-transparent bg-transparent px-2.5 py-1.5 text-xs text-muted-foreground data-[selected]:border-primary data-[selected]:text-foreground"
-              >
-                {label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
       </header>
-      <div className="min-h-0 flex-1 overflow-auto px-5 py-5">
+      <div className="detail-content min-h-0 flex-1 overflow-auto">
         {tab === 'overview' && <OverviewTab detail={detail} />}
         {tab === 'stages' && <StagesTab detail={detail} />}
         {tab === 'workflow' && <WorkflowTab detail={detail} selected={node} onSelect={setNode} />}
@@ -208,35 +211,72 @@ export function App() {
     select(`generation~${run.runId}`);
   }, []);
 
+  const showRunView = (showArchived: boolean) => {
+    setArchivedView(showArchived);
+    setFilter('all');
+    if (id) back();
+  };
+
   const visible = filter === 'all' ? runs : runs.filter((r) => r.kind === filter);
 
   return (
     <TooltipProvider>
-      {/* Width must come from the documented CSS variable: the sidebar and the
-          gap it reserves are both sized from it, so a width class on <Sidebar>
-          silently pushes content underneath. */}
-      <SidebarProvider
-        className="h-full"
-        style={{ '--sidebar-width': '18rem' } as React.CSSProperties}
-      >
-        <RunList
-          runs={visible}
-          selected={id}
-          filter={filter}
-          onFilter={setFilter}
-          onSelect={select}
-        />
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="app-shell">
+        <header className="workspace-bar">
+          <div className="workspace-identity">
+            <div className="workspace-brand" aria-label="Freya agent builder">
+              <span className="brand-mark" aria-hidden="true">
+                <span />
+              </span>
+              <span className="brand-copy">
+                <strong>freya</strong>
+                <span>agent builder</span>
+              </span>
+            </div>
+            <span className="workspace-divider" aria-hidden="true" />
+            <span className="workspace-context">{id ? 'Run inspector' : 'Builder workspace'}</span>
+          </div>
+          <nav className="workspace-nav" aria-label="Workspace views">
+            <button
+              type="button"
+              aria-current={!archivedView ? 'page' : undefined}
+              onClick={() => showRunView(false)}
+            >
+              Runs
+            </button>
+            <button
+              type="button"
+              aria-current={archivedView ? 'page' : undefined}
+              onClick={() => showRunView(true)}
+            >
+              Archive
+            </button>
+          </nav>
+          <div className="workspace-actions">
+            <div className="workspace-local">
+              <span className="local-indicator" />
+              <span>Local workspace</span>
+            </div>
+            <NewRunAction
+              onStarted={started}
+              trigger={
+                <Button variant="outline" className="workspace-cta">
+                  <Sparkles className="size-3.5" />
+                  <span>Generate</span>
+                </Button>
+              }
+            />
+          </div>
+        </header>
+        <main className="app-main">
           {error && <p className="p-4 text-xs text-destructive">{error}</p>}
           {!id && !error && (
             <RunTable
               runs={visible}
               selected={id}
+              filter={filter}
+              onFilter={setFilter}
               archivedView={archivedView}
-              onToggleArchived={(show) => {
-                setArchivedView(show);
-                setFilter('all');
-              }}
               onSelect={select}
               onStarted={started}
               onArchived={onArchived}
@@ -244,13 +284,18 @@ export function App() {
             />
           )}
           {id && !detail && (
-            <p className="p-10 text-center text-xs text-muted-foreground">Loading run…</p>
+            <div className="detail-loading">
+              <div className="loading-line loading-line-short" />
+              <div className="loading-line loading-line-title" />
+              <div className="loading-line loading-line-tabs" />
+              <div className="loading-panel" />
+            </div>
           )}
           {id && detail && (
             <Detail detail={detail} onBack={back} onArchived={onArchived} onRestored={onRestored} />
           )}
         </main>
-      </SidebarProvider>
+      </div>
     </TooltipProvider>
   );
 }

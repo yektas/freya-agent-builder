@@ -20,6 +20,9 @@ import { createGenerationTrace } from './generation-trace.ts';
 import { estimateCost, hasUsage, sumUsage } from './usage.ts';
 import type { Generator } from './contracts.ts';
 import { assertPracticeInputs } from './practice-inputs.ts';
+import { freyaStrategyInstructions, parseFreyaStrategy } from './strategies.ts';
+import type { FreyaStrategy } from './strategies.ts';
+import { routingComplexity } from './routing-safety.ts';
 
 // Totals a generator's recorded calls so a run reports one comparable figure.
 function usageOf(calls: CallRecord[], model: string) {
@@ -29,8 +32,10 @@ function usageOf(calls: CallRecord[], model: string) {
 
 export type EventOptions = {
   briefs: string[];
+  caseFolder?: string;
   openapi: string;
   kit: string;
+  mockUrl?: string;
   slot: string;
   out: string;
   brief?: string;
@@ -41,6 +46,7 @@ export type EventOptions = {
   reasoningEffort?: ReasoningEffort;
   final?: boolean;
   repetitions?: number;
+  strategy?: FreyaStrategy;
 };
 
 function workflowGenerator(
@@ -51,16 +57,18 @@ function workflowGenerator(
     onCall?: (call: CallRecord) => void;
     reasoningSummary?: boolean;
     reasoningEffort?: ReasoningEffort;
+    strategy?: FreyaStrategy;
   } = {},
 ) {
+  const { strategy, ...callbacks } = observation;
   return createOpenAIGenerator(
     model,
     {
-      instructions: freyaRecipe.instructions,
+      instructions: freyaStrategyInstructions(parseFreyaStrategy(strategy)),
       schema: workflowCandidateSchema,
       maxOutputTokens: freyaRecipe.limits.maxOutputTokens,
       maxCalls: freyaRecipe.limits.maxCalls,
-      ...observation,
+      ...callbacks,
     },
     transport,
   );
@@ -70,12 +78,22 @@ function workflowGenerator(
 export async function generateFreyaJson(
   options: Pick<
     EventOptions,
-    'briefs' | 'openapi' | 'kit' | 'model' | 'timeoutMs' | 'reasoningEffort'
+    | 'briefs'
+    | 'caseFolder'
+    | 'openapi'
+    | 'kit'
+    | 'mockUrl'
+    | 'model'
+    | 'timeoutMs'
+    | 'reasoningEffort'
+    | 'strategy'
   > & {
     quiet?: boolean;
     showDraft?: boolean;
     reasoningSummary?: boolean;
     out?: string;
+    /** Stable inspector-facing label; omitted by direct CLI generations. */
+    runName?: string;
     /**
      * Caller-chosen run id, so a run started from the inspector is addressable
      * before its model call returns. Omit it for a generated id.
@@ -83,10 +101,14 @@ export async function generateFreyaJson(
     runId?: string;
   },
 ) {
+  const strategy = parseFreyaStrategy(options.strategy);
+  const instructionsHash = hash(freyaStrategyInstructions(strategy));
   const trace = await createGenerationTrace(
     options.out || 'experiments',
     {
       ...options,
+      strategy,
+      instructionsHash,
       provider: 'openai',
       limits: freyaRecipe.limits,
     },
@@ -111,10 +133,19 @@ export async function generateFreyaJson(
     const signal = AbortSignal.timeout(
       Math.min(options.timeoutMs, freyaRecipe.limits.generationTimeoutMs),
     );
-    progress.report(`Reading briefs: ${options.briefs.join(', ')}`);
+    progress.report(
+      options.caseFolder
+        ? `Reading case folder: ${options.caseFolder}`
+        : `Reading briefs: ${options.briefs.join(', ')}`,
+    );
     progress.report(`Reading original OpenAPI: ${options.openapi}`);
     progress.report('Reading event workflow and tool documentation.');
-    const task = await loadFreyaTask(options.briefs, options.openapi, resolve(options.kit));
+    const task = await loadFreyaTask(
+      options.briefs,
+      options.openapi,
+      resolve(options.kit),
+      options.caseFolder,
+    );
     trace.update({ task, inputHash: hash(task) });
     progress.report(
       `Loaded ${task.tools.length} tools: ${task.tools.map((tool) => tool.name).join(', ')}`,
@@ -122,6 +153,7 @@ export async function generateFreyaJson(
     progress.report(
       `Strategy: one direct-generation call to ${options.model}; no planning, audit, or repair calls.`,
     );
+    progress.report(`Builder variant: ${strategy}; instructions hash: ${instructionsHash}.`);
     progress.report(`Reasoning effort: ${options.reasoningEffort || 'API default'}.`);
     progress.report(
       `Limits: ${freyaRecipe.limits.maxOutputTokens} output tokens; ${Math.min(options.timeoutMs, freyaRecipe.limits.generationTimeoutMs) / 1000}s deadline.`,
@@ -134,6 +166,7 @@ export async function generateFreyaJson(
       onCall: trace.call,
       reasoningSummary: options.reasoningSummary,
       reasoningEffort: options.reasoningEffort,
+      strategy,
     });
     const result = await freyaRecipe.generate(task, {
       generate: (input) => {
@@ -146,7 +179,11 @@ export async function generateFreyaJson(
         progress.report('Checking model output and binding original tool schemas locally.');
         trace.update({ rawCandidate: raw, phase: 'compile' });
         const candidate = parseWorkflowCandidate(raw);
-        const workflow = compileWorkflow(input, candidate);
+        const workflow = compileWorkflow(input, candidate, {
+          runtimeContract: strategy === 'runtime-contract',
+          preciseRouting: strategy === 'precise-routing',
+          mockUrl: options.mockUrl,
+        });
         // The workflow JSON is this command's only deliverable; record it as a
         // standalone artifact rather than leaving it nested in run.json.
         trace.artifact('compiled.workflow.json', workflow);
@@ -156,19 +193,10 @@ export async function generateFreyaJson(
         return workflow;
       },
     });
-    const nodes = {
-      ...(result.workflow.nodes as Record<string, any>),
-      ...(result.workflow.global_nodes as Record<string, any>),
-    };
+    const complexity = routingComplexity(result.workflow);
     progress.report(
-      `Compiled ${Object.keys(nodes).length} nodes; initial node: ${result.workflow.initial_node}.`,
+      `Compiled ${complexity.nodes} nodes, ${complexity.transitions} transition${complexity.transitions === 1 ? '' : 's'}; maximum ${complexity.maxIntentRoutesPerNode} intent routes in one node; ${complexity.customRoutingPrompts} custom routing prompts; initial node: ${result.workflow.initial_node}.`,
     );
-    for (const [name, node] of Object.entries(nodes)) {
-      const tools = (node.tools || []).map((tool: any) => tool.function.name).join(', ') || 'none';
-      const targets =
-        (node.transitions || []).map((edge: any) => edge.target_node).join(', ') || 'none';
-      progress.report(`Node ${name}: ${node.node_type}; tools: ${tools}; routes: ${targets}.`);
-    }
     trace.update({ workflow: result.workflow, workflowHash: hash(result.workflow) });
     // Report the whole run's spend, not just the last call's, so a recipe that
     // grows more model calls still shows one comparable total.
@@ -213,6 +241,7 @@ export async function runFreya(
   } = {},
 ): Promise<{ status: string; path: string; error?: string }> {
   const provider = 'openai';
+  const strategy = parseFreyaStrategy(options.strategy);
   const env = dependencies.env ?? process.env;
   if (
     !env.FREYA_API_KEY?.trim() ||
@@ -223,7 +252,7 @@ export async function runFreya(
       'Freya runs require FREYA_API_KEY and FREYA_BANK_TEAM_KEY (at least 16 characters).',
     );
   }
-  if (!options.briefs.length || !/^[\w.+-]+$/.test(options.slot)) {
+  if ((!options.briefs.length && !options.caseFolder) || !/^[\w.+-]+$/.test(options.slot)) {
     throw new Error(
       'Supply brief files and a slot containing only letters, digits, _, ., +, or -.',
     );
@@ -238,7 +267,7 @@ export async function runFreya(
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const kit = resolve(options.kit);
-  const task = await loadFreyaTask(options.briefs, options.openapi, kit);
+  const task = await loadFreyaTask(options.briefs, options.openapi, kit, options.caseFolder);
   const practice = !options.final;
   const repetitions = options.repetitions ?? 1;
   if (![1, 3].includes(repetitions)) {
@@ -246,9 +275,13 @@ export async function runFreya(
   }
   if (
     options.final &&
-    (options.brief || options.only || options.style || options.repetitions !== undefined)
+    (!options.mockUrl ||
+      options.brief ||
+      options.only ||
+      options.style ||
+      options.repetitions !== undefined)
   ) {
-    throw new Error('Final mode does not accept practice settings.');
+    throw new Error('Final mode requires a mock URL and does not accept practice settings.');
   }
   // Validate practice selection before any model call or remote mutation.
   const casesPath = join(kit, 'public-test-set.json');
@@ -299,6 +332,7 @@ export async function runFreya(
     dependencies.generator ??
     workflowGenerator(options.model, fetch, {
       reasoningEffort: options.reasoningEffort,
+      strategy,
     });
   const record: Record<string, any> = {
     kind: 'freya-live-run',
@@ -309,11 +343,18 @@ export async function runFreya(
     source,
     kit: { hash: hash(kitFiles), files: kitFiles },
     nodeVersion: process.version,
-    config: { ...options, provider, kit, model: options.model, limits: freyaRecipe.limits },
+    config: {
+      ...options,
+      strategy,
+      instructionsHash: hash(freyaStrategyInstructions(strategy)),
+      provider,
+      kit,
+      model: options.model,
+      limits: freyaRecipe.limits,
+    },
     calls: generator.calls,
     usage: null,
-    modelCallPurpose:
-      'Generate one workflow blueprint directly from original brief(s), OpenAPI, and verified platform documentation.',
+    modelCallPurpose: `Generate one workflow blueprint from original brief(s), OpenAPI, and verified platform documentation with the ${strategy} builder instructions.`,
     stages: [],
     evaluation: { score: null, source: 'not-evaluated' },
   };
@@ -386,7 +427,11 @@ export async function runFreya(
             ),
           compile: async (input, candidate) =>
             stage('workflow', async () => {
-              const workflow = compileWorkflow(input, parseWorkflowCandidate(candidate));
+              const workflow = compileWorkflow(input, parseWorkflowCandidate(candidate), {
+                runtimeContract: strategy === 'runtime-contract',
+                preciseRouting: strategy === 'precise-routing',
+                mockUrl: options.mockUrl,
+              });
               await writeFile(
                 join(directory, 'compiled.workflow.json'),
                 JSON.stringify(workflow, null, 2) + '\n',

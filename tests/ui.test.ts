@@ -16,6 +16,7 @@ import {
   loadRun,
   readRunFile,
   restoreRun,
+  silentPracticeRun,
 } from '../src/ui/records.ts';
 import { createUiServer } from '../src/ui/server.ts';
 
@@ -392,10 +393,58 @@ test('renders practice rows with failure reasons', async () => {
   assert.equal(practice.total, 10);
   assert.equal(practice.cases.length, 2);
   assert.equal(practice.summaryOnly, false);
+  assert.equal(practice.conversationPassed, null);
   const failed = practice.cases.find((item) => item.id === 'PUB-02');
   assert.equal(failed?.pass, false);
   assert.deepEqual(failed?.failed, ['outcome mismatch', 'not closed']);
   assert.deepEqual(practice.cases[0].tools, ['verify_identity', 'close_call']);
+});
+
+test('separates kit ledger failures from conversation verdicts without changing scores', async () => {
+  const root = await fixture();
+  const directory = await seedFreyaRun(root);
+  const rows = [
+    { id: 'SYN-1', call_id: 'synthetic-1', pass: true, failed: [] },
+    {
+      id: 'SYN-2',
+      call_id: 'synthetic-2',
+      pass: false,
+      failed: ['the call was not closed with close_call'],
+    },
+    {
+      id: 'SYN-3',
+      call_id: 'synthetic-3',
+      pass: false,
+      failed: ['conversation: synthetic failed policy check'],
+    },
+  ];
+  const result: any = {
+    passed: 1,
+    total: 3,
+    runs: 1,
+    simulation_id: 'synthetic-simulation',
+    iteration_id: 'synthetic-iteration',
+    rows,
+  };
+  await writeFile(join(directory, 'practice.json'), JSON.stringify(result));
+  let detail = await loadRun(root, 'live-1');
+  assert.equal(detail?.practice?.passed, 1);
+  assert.equal(detail?.practice?.conversationPassed, 2);
+  assert.equal(detail?.practice?.cases[1].pass, false);
+  // All repetitions must pass, even when the last repetition has a green judge verdict.
+  result.runs = 2;
+  result.all_rows = [
+    rows.map((row) =>
+      row.id === 'SYN-2' ? { ...row, failed: ['conversation: failed in first repetition'] } : row,
+    ),
+    rows,
+  ];
+  await writeFile(join(directory, 'practice.json'), JSON.stringify(result));
+  detail = await loadRun(root, 'live-1');
+  assert.equal(detail?.practice?.conversationPassed, 1);
+  delete result.all_rows;
+  await writeFile(join(directory, 'practice.json'), JSON.stringify(result));
+  assert.equal((await loadRun(root, 'live-1'))?.practice?.conversationPassed, null);
 });
 
 test('reads generation-only traces and the JSON-encoded blueprint', async () => {
@@ -428,7 +477,7 @@ test('reads generation-only traces and the JSON-encoded blueprint', async () => 
   // The unparsable line is dropped rather than failing the whole trace.
   assert.equal(detail?.trace.length, 2);
   assert.equal(detail?.trace[0].summary, 'Reading briefs');
-  assert.equal(detail?.trace[1].summary, 'draft: {"workflowJson"');
+  assert.equal(detail?.trace[1].summary, '15 characters received');
 });
 
 test('marks the internal build baseline as unevaluated and synthetic', async () => {
@@ -465,7 +514,7 @@ test('marks the internal build baseline as unevaluated and synthetic', async () 
   assert.deepEqual(detail?.issues, ['bad thing']);
 });
 
-test('groups streamed fragments without losing whitespace or hiding later failures', async () => {
+test('counts legacy streamed fragments without exposing escaped text or hiding failures', async () => {
   const root = await fixture();
   const dir = join(root, 'generation', 'fragmented');
   await mkdir(dir, { recursive: true });
@@ -482,7 +531,15 @@ test('groups streamed fragments without losing whitespace or hiding later failur
   await writeFile(
     join(dir, 'trace.jsonl'),
     [
-      ...entries,
+      ...entries.slice(0, 2),
+      {
+        elapsedMs: 2,
+        kind: 'progress',
+        data: {
+          message: '[generate +0.0s] Waiting for model completion; 10 draft characters received.',
+        },
+      },
+      ...entries.slice(2),
       { elapsedMs: 6, kind: 'progress', data: { message: 'waiting' } },
       { elapsedMs: 7, kind: 'model-event', data: { kind: 'summary', text: 'Public ' } },
       { elapsedMs: 8, kind: 'model-event', data: { kind: 'summary', text: 'summary' } },
@@ -493,15 +550,15 @@ test('groups streamed fragments without losing whitespace or hiding later failur
   );
   const detail = await loadRun(root, 'generation~fragmented');
   assert.equal(detail?.trace.length, 4);
-  assert.equal(detail?.trace[0].summary, 'draft: ' + fragments.join(''));
+  assert.equal(detail?.trace[0].summary, `${fragments.join('').length} characters received`);
   assert.equal(detail?.trace[0].fragments, 5);
   assert.equal(detail?.trace[0].endedElapsedMs, 4);
-  assert.equal(detail?.trace[2].summary, 'summary: Public summary');
+  assert.equal(detail?.trace[2].summary, '14 characters received');
   assert.equal(detail?.trace[3].summary, 'max_output_tokens');
   assert.equal(
     (await readRunFile(root, 'generation~fragmented', 'trace.jsonl'))?.split('\n').filter(Boolean)
       .length,
-    9,
+    10,
   );
 });
 
@@ -527,6 +584,36 @@ test('surfaces a failed run and its error without a practice result', async () =
   assert.equal(detail?.summary.evaluation.score, null);
   assert.equal(detail?.practice, null);
   assert.equal(detail?.workflow, null);
+});
+
+test('a run in which the agent model never spoke is not read as a score', () => {
+  // Recorded 2026-10-11 runs v10 and v12 both stored 0/10 while the agent model never
+  // answered after the customer spoke. That is an infrastructure outage, not a builder
+  // result, and must never be compared as one.
+  const silentRow = { slowest_turn_s: 0, ended: 'customer-ended-call' };
+  assert.equal(silentPracticeRun({ rows: [silentRow, silentRow, silentRow] }), true);
+  // A real failing run still reads as a score.
+  assert.equal(
+    silentPracticeRun({
+      rows: [
+        { slowest_turn_s: 12.4, ended: 'customer-ended-call' },
+        { slowest_turn_s: 0, ended: 'customer-ended-call' },
+      ],
+    }),
+    false,
+  );
+  // An agent that hung up but had already replied is a real run.
+  assert.equal(
+    silentPracticeRun({
+      rows: [
+        { slowest_turn_s: 0, ended: 'assistant-ended-call' },
+        { slowest_turn_s: 0, ended: 'assistant-ended-call' },
+      ],
+    }),
+    false,
+  );
+  assert.equal(silentPracticeRun({ rows: [silentRow] }), false);
+  assert.equal(silentPracticeRun({}), false);
 });
 
 test('archiveRun and restoreRun work at the records level, with guards', async () => {

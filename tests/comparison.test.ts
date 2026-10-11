@@ -46,6 +46,7 @@ import { join } from 'node:path';
 import { hash } from '../src/experiments.ts';
 import { loadFreyaTask } from '../src/workflow.ts';
 import { compareRuns } from '../src/comparison.ts';
+import { freyaStrategyInstructions } from '../src/strategies.ts';
 
 test('comparison keeps failed builds visible and refuses stale or mismatched uploaded results', async () => {
   const root = await mkdtemp(join(tmpdir(), 'comparison-'));
@@ -95,6 +96,17 @@ test('comparison keeps failed builds visible and refuses stale or mismatched upl
       }),
     );
     assert.equal((await compareRuns([path])).rows[0].score, 1);
+    const baseline = (await compareRuns([path])).rows[0];
+    assert.equal(baseline.strategy, 'direct');
+    assert.equal(baseline.instructionsHash, null);
+    const candidate = JSON.parse(await readFile(path, 'utf8'));
+    candidate.config.strategy = 'validated-dates';
+    candidate.config.instructionsHash = hash(freyaStrategyInstructions('validated-dates'));
+    await writeFile(path, JSON.stringify(candidate));
+    const candidateRow = (await compareRuns([path])).rows[0];
+    assert.equal(candidateRow.strategy, 'validated-dates');
+    assert.equal(candidateRow.instructionsHash, candidate.config.instructionsHash);
+    assert.equal(candidateRow.comparisonGroup, baseline.comparisonGroup);
     await writeFile(
       join(root, 'upload.json'),
       JSON.stringify({ ...upload, workflowHash: 'changed' }),

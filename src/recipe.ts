@@ -67,7 +67,10 @@ type RecipeSteps = {
 // The internal recipe above remains available as the original measurable baseline.
 export const freyaRecipe = {
   // Output budget includes reasoning tokens as well as the serialized workflow.
-  limits: { maxCalls: 1, maxOutputTokens: 24000, generationTimeoutMs: 300000, timeoutMs: 1800000 },
+  // Generation deadline covers the slowest recorded generation, which the old 300s
+  // aborted at 51,202 draft characters with workflowJson already closed, and still
+  // leaves the total deadline room for compile, register, export, and practice.
+  limits: { maxCalls: 1, maxOutputTokens: 24000, generationTimeoutMs: 600000, timeoutMs: 1800000 },
   instructions: `You build a Freya phone-agent workflow from the ORIGINAL supplied bank brief(s) and OpenAPI.
 Use only those briefs for business rules. Tool names, arguments, and allowed values come from the supplied tool catalog and original OpenAPI. Platform mechanics come from platformDocuments.
 Return JSON with workflowJson (a JSON-encoded workflow blueprint) and uncertainties (strings). No tool schemas, function handlers, authentication, URLs, or agent_config in your output.
@@ -76,8 +79,12 @@ Follow the event node, extraction, transition, routing, and prompt formats in pl
 Replace every bank tool definition in conversation tools and api_request pre_actions with a name string, or {name, response_mapping?, pre_process_code?, post_process_code?, bodyDefaults?}. These are references, not schemas. bodyDefaults optionally binds existing body fields to workflow variables using {{variable}} or literals; omit it for fields the phone model should fill. customer_id always comes from the call variable.
 For code nodes, pre_actions contains only {code: "Python source"}; use vars for reading/writing state and wrap failures with fallbacks. Never put {{ or }} in Python.
 For end_call nodes, omit terminal and use farewell (optional string); the local compiler creates the terminal. End nodes have transitions: [].
-The compiler binds each reference to the exact supplied request schema and HTTP endpoint. Tool response variables have the documented <tool>_response.data.* names. Use the original response schemas to interpret results.
+The compiler binds each reference to the exact supplied request schema and HTTP endpoint. After every bank tool call the platform writes scalars as flattened leaves such as <tool>_response.data.ok. A list or object is not written that way, so the compiler publishes each container as JSON TEXT under its own response path: vars.get('<tool>_response.data.products') returns a JSON string and json.loads gives the whole array. The compiler also writes vars['builder_result_<exact tool name>'] as JSON TEXT of the whole result envelope. Use either one in Python; json.loads whatever you read. Never write a list or object straight into vars. A response_mapping of data.products supplies nothing, so never gate a decision on one.
 Implement the full brief: identity, third parties, refusal, errors, corrections, and every required final bank record. Never invent policy. Route on authoritative results; do not claim a failed write succeeded. After a tool result, speak or call the next tool. Ensure every path can end the call. Use the brief's now/calendar, not the wall clock.
+Closing is the most important line of this brief: every outcome the brief lists must actually produce its required final bank record, reached from EVERY path including refusal, decline, dispute, already-paid, hardship, transfer, tool failure and exhausted collections. A conversation that ends politely without that record scores zero even when it sounded right. Give the closing node the brief's exact outcome and reason values and make sure the graph actually reaches it.
+Prefer matches_intent transitions plus model-filled tool arguments over heavy extraction. Extraction on this platform discards low-confidence values and returns malformed text, so a value that decides a branch must not depend on one. Extract only a single enum per fork; prefer a bare self-transition with always over an is_tool_call transition that the router can skip.
+Do the arithmetic and calendar logic in code nodes from the supplied now variable, and hand the model finished facts as text. Ask the model to state the brief's exact phrases for mandatory sentences (sympathy, the recorded-promise line, the digital-assistant answer) rather than inventing its own wording.
+Keep the graph compact: prefer one conversation node per stage with a small task_message over many narrow nodes. Every conversation node needs an always self-transition or an explicit always fallback so the call cannot stall.
 Generate directly in one call. No manual edits, planning calls, audit, or repair. Structural acceptance and practice results are separate.`,
 
   async generate(task: Task, steps: Pick<FreyaSteps, 'generate' | 'compile'>) {

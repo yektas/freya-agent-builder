@@ -119,8 +119,8 @@ export function PracticeAction({ detail }: { detail: RunDetail }) {
       </div>
       <p className="text-[11px] text-muted-foreground">
         {!uploaded ? 'Upload this generation first. ' : ''}
-        Runs simulated customers on Freya; typically 3–11 minutes per repetition, with a 25-minute
-        deadline. No new builder model call.
+        Remote simulations · about 3–11 min per repetition · 25-minute deadline · no new builder
+        model call.
       </p>
       {availability?.problem && <p className="text-xs text-warning">{availability.problem}</p>}
       {job && (

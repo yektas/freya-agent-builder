@@ -1,4 +1,4 @@
-// Local synthetic repository and exports only.
+// Local synthetic repository and export only.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFileSync } from 'node:child_process';
@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { hash } from '../src/experiments.ts';
 import { prepareSubmission, finalizeSubmission } from '../src/submission.ts';
 
-test('submission preserves exports, rejects changed artifacts, and verifies code and files at the submission commit', async () => {
+test('single-case submission matches the selected export, trace, and committed builder', async () => {
   const root = await mkdtemp(join(tmpdir(), 'submission-'));
   const git = (...args: string[]) =>
     execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -21,60 +21,96 @@ test('submission preserves exports, rejects changed artifacts, and verifies code
     git('add', 'builder.ts');
     git('commit', '-m', 'Synthetic source');
     const commit = git('rev-parse', 'HEAD').trim();
-    const runs = [];
-    for (const n of [1, 2]) {
-      const dir = join(root, `run-${n}`);
-      await mkdir(dir);
-      const exported = {
-        workflow_id: `w${n}`,
-        agent_id: `a${n}`,
-        workflow: { nodes: { done: { node_type: 'end_call' } } },
-      };
-      const run = {
-        kind: 'freya-live-run',
-        status: 'completed',
-        config: { final: true, model: 'synthetic' },
-        source: { hash: hash(files), files, git: { commit, dirty: false } },
-        startedAt: '2026-10-11T17:00:00Z',
-        endedAt: '2026-10-11T17:01:00Z',
-        elapsedMs: 60000,
-        calls: [],
-        modelCallPurpose: 'Synthetic fixture',
-        task: { tools: [], briefs: [{ text: `Synthetic ${n}` }] },
-        inputHash: `input-${n}`,
-        workflow: exported.workflow,
-        registration: { workflow_id: `w${n}`, agent_id: `a${n}` },
-        exportHash: hash(exported),
-        evaluation: { score: null },
-      };
-      const path = join(dir, 'run.json');
-      await writeFile(path, JSON.stringify(run));
-      runs.push(path);
-      await writeFile(join(dir, 'exported.workflow.json'), JSON.stringify(exported, null, 2));
-    }
+    const dir = join(root, 'run');
+    await mkdir(dir);
+    const exported = {
+      workflow_id: 'w1',
+      agent_id: 'a1',
+      workflow: {
+        nodes: {
+          done: {
+            node_type: 'end_call',
+            tools: [
+              {
+                function: {
+                  name: 'synthetic_tool',
+                  handler: '__function__:api_call',
+                  parameters: {
+                    properties: {
+                      url: { default: 'https://bank.example.workers.dev/synthetic_tool' },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    };
+    const run = {
+      kind: 'freya-live-run',
+      status: 'completed',
+      config: { final: true, model: 'synthetic', mockUrl: 'https://bank.example.workers.dev' },
+      source: { hash: hash(files), files, git: { commit, dirty: false } },
+      startedAt: '2026-10-11T17:00:00Z',
+      endedAt: '2026-10-11T17:01:00Z',
+      elapsedMs: 60000,
+      calls: [],
+      modelCallPurpose: 'Synthetic fixture',
+      task: {
+        tools: [{ name: 'synthetic_tool', url: 'https://original.example.invalid/synthetic_tool' }],
+      },
+      inputHash: 'input',
+      workflow: exported.workflow,
+      registration: { workflow_id: 'w1', agent_id: 'a1' },
+      exportHash: hash(exported),
+      evaluation: { score: null },
+    };
+    const runFile = join(dir, 'run.json');
+    await writeFile(runFile, JSON.stringify(run));
+    await writeFile(join(dir, 'exported.workflow.json'), JSON.stringify(exported, null, 2));
     const options = {
-      runs,
+      runs: [runFile],
       out: 'submission',
       team: 'synthetic',
+      members: [{ name: 'Synthetic Tester', email: 'synthetic@example.invalid' }],
       repo: 'https://example.invalid/repo',
       commit,
+      mockUrl: 'https://bank.example.workers.dev',
+      runCommand: 'node src/final.ts {case_folder} {mock_url}',
     };
-    const changed = join(root, 'run-1/exported.workflow.json');
-    const original = await readFile(changed, 'utf8');
-    await writeFile(changed, original.replace('end_call', 'conversation'));
-    await assert.rejects(() => prepareSubmission(options, root), /Export changed/);
-    await writeFile(changed, original);
-    const pending = await prepareSubmission(options, root);
-    assert.equal(pending.commit, null);
-    assert.equal(await readFile(join(root, 'submission/hidden-1.workflow.json'), 'utf8'), original);
-    await assert.rejects(() => finalizeSubmission('submission', commit, root)); // artifacts not committed yet
-    git(
-      'add',
-      'submission/hidden-1.workflow.json',
-      'submission/hidden-2.workflow.json',
-      'submission/hidden-1.trace.json',
-      'submission/hidden-2.trace.json',
+    await assert.rejects(
+      () => prepareSubmission({ ...options, mockUrl: 'http://bank.example.workers.dev' }, root),
+      /Submission needs/,
     );
+    await assert.rejects(
+      () => prepareSubmission({ ...options, mockUrl: 'https://other.workers.dev' }, root),
+      /bound to this mock URL/,
+    );
+    const original = await readFile(join(dir, 'exported.workflow.json'), 'utf8');
+    await writeFile(
+      join(dir, 'exported.workflow.json'),
+      original.replace('end_call', 'conversation'),
+    );
+    await assert.rejects(() => prepareSubmission(options, root), /Export changed/);
+    await writeFile(join(dir, 'exported.workflow.json'), original);
+
+    const pending = await prepareSubmission(options, root);
+    assert.deepEqual(Object.keys(pending), [
+      'team',
+      'members',
+      'repo',
+      'commit',
+      'run_command',
+      'workflow',
+      'trace',
+      'mock_url',
+    ]);
+    assert.equal(pending.workflow, 'submission/final.workflow.json');
+    assert.equal(pending.trace, 'submission/final.trace.json');
+    assert.equal(pending.mock_url, options.mockUrl);
+    await assert.rejects(() => finalizeSubmission('submission', commit, root));
+    git('add', 'submission/final.workflow.json', 'submission/final.trace.json');
     git('commit', '-m', 'Synthetic selected artifacts');
     const submissionCommit = git('rev-parse', 'HEAD').trim();
     const form = await finalizeSubmission('submission', submissionCommit, root);

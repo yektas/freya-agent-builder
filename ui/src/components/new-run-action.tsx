@@ -133,13 +133,13 @@ export function NewRunAction({
           )
         }
       />
-      <SheetContent className="sm:max-w-md">
+      <SheetContent className="generation-sheet sm:max-w-md">
         <SheetHeader>
-          <SheetTitle>New run</SheetTitle>
+          <p className="generation-kicker">DIRECT GENERATION</p>
+          <SheetTitle>Generate an agent</SheetTitle>
           <SheetDescription>
-            One direct-generation call: the model writes a workflow blueprint, it is compiled
-            locally against the original tool schemas, and the run stops there. Registering it on
-            Freya stays a separate action on the finished run.
+            One model call creates a workflow draft from the configured event task. The builder
+            compiles it locally; you can inspect it before registering it on Freya.
           </SheetDescription>
         </SheetHeader>
 
@@ -214,8 +214,8 @@ export function NewRunAction({
           {running && (
             <p className="border-l-2 border-warning py-0.5 pl-3 text-[11px] leading-relaxed text-muted-foreground">
               <Terminal className="mr-1 inline size-3 align-[-2px]" />
-              {running.runId} is still running ({running.model}). Wait for it to finish before
-              starting another.
+              {running.runName ?? running.runId} is still running ({running.model}). Wait for it to
+              finish before starting another.
             </p>
           )}
           {!options?.available && options?.problem && (

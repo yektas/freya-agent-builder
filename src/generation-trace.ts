@@ -67,6 +67,7 @@ export async function createGenerationTrace(root: string, config: unknown, runId
   // Each call announces itself before and after transport, so usage is summed
   // from the distinct call objects rather than added twice per announcement.
   const metered = new Set<CallRecord>();
+  const announced = new WeakSet<CallRecord>();
   const model = () =>
     typeof (config as { model?: unknown } | null)?.model === 'string'
       ? (config as { model: string }).model
@@ -107,6 +108,17 @@ export async function createGenerationTrace(root: string, config: unknown, runId
       mode: 0o600,
     });
   }
+  const streams = new Map<string, { chars: number; pending: string; file: string }>();
+  // Retain a short tail so credentials split across transport fragments are redacted.
+  const tailLength = Math.max(0, ...secrets.map((secret) => secret.length - 1));
+  function flushStream(stream: { pending: string; file: string }, final = false) {
+    const sanitized = String(clean(stream.pending));
+    const count = final ? sanitized.length : Math.max(0, sanitized.length - tailLength);
+    if (count) {
+      appendFileSync(join(directory, stream.file), sanitized.slice(0, count), { mode: 0o600 });
+    }
+    stream.pending = sanitized.slice(count);
+  }
   event('start', config);
   save();
   return {
@@ -119,26 +131,50 @@ export async function createGenerationTrace(root: string, config: unknown, runId
       save();
     },
     model(value: ModelEvent) {
-      event('model-event', value);
-      if (value.text) {
-        log(`\n[model ${value.kind}] ${value.text}\n`);
+      if ((value.kind === 'draft' || value.kind === 'summary') && value.text) {
+        let stream = streams.get(value.kind);
+        if (!stream) {
+          stream = { chars: 0, pending: '', file: `model-${value.kind}.txt` };
+          streams.set(value.kind, stream);
+          event('model-stream-started', { kind: value.kind, artifact: stream.file });
+        }
+        stream.chars += value.text.length;
+        stream.pending += value.text;
+        flushStream(stream);
+        return;
       }
+      event('model-event', value);
     },
     call(value: CallRecord) {
       // Persist before transport starts and again on completion/failure.
       record.calls = [structuredClone(value)];
       record.usage = usageOf([value]);
+      if (!value.error && !value.response && announced.has(value)) {
+        save();
+        return;
+      }
+      announced.add(value);
       event(
         value.error
           ? 'model-call-failed'
           : value.response
             ? 'model-call-completed'
             : 'model-call-started',
-        value,
+        {
+          endpoint: value.endpoint,
+          elapsedMs: value.elapsedMs,
+          usage: value.usage,
+          error: value.error,
+          details: 'run.json',
+        },
       );
       save();
     },
     finish(error?: unknown) {
+      for (const [kind, stream] of streams) {
+        flushStream(stream, true);
+        event('model-stream-ended', { kind, chars: stream.chars, artifact: stream.file });
+      }
       record.status = error ? 'failed' : 'completed';
       if (error) {
         const failure =

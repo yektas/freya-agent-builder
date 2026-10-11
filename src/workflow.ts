@@ -3,6 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import type { JsonObject, Task, Tool } from './contracts.ts';
 import { object, parseTask } from './validation.ts';
+import { runtimeContractIssues, snapshotToolResult } from './runtime-contract.ts';
+import { applyInputContract } from './input-contract.ts';
+import { routingSafetyIssues } from './routing-safety.ts';
+import { readCaseDocuments } from './case-documents.ts';
 
 export type WorkflowCandidate = { workflowJson: string; uncertainties: string[] };
 export type Workflow = JsonObject;
@@ -92,10 +96,19 @@ export async function loadFreyaTask(
   briefPaths: string[],
   openapiPath: string,
   kit: string,
+  caseFolder?: string,
 ): Promise<Task> {
-  const briefs = await Promise.all(
-    briefPaths.map(async (path) => ({ path: resolve(path), text: await readFile(path, 'utf8') })),
-  );
+  const briefs = caseFolder
+    ? (await readCaseDocuments(caseFolder)).map((document) => ({
+        path: resolve(caseFolder, document.path),
+        text: document.text,
+      }))
+    : await Promise.all(
+        briefPaths.map(async (path) => ({
+          path: resolve(path),
+          text: await readFile(path, 'utf8'),
+        })),
+      );
   const openapiText = await readFile(openapiPath, 'utf8');
   const openapi: unknown = JSON.parse(openapiText);
   if (!object(openapi)) {
@@ -108,10 +121,13 @@ export async function loadFreyaTask(
     })),
   );
   return parseTask({
-    id: briefPaths.map((path) => basename(path, '.md')).join('+'),
-    description: briefs.map((brief) => brief.text).join('\n\n'),
+    id: caseFolder
+      ? basename(resolve(caseFolder))
+      : briefPaths.map((path) => basename(path, '.md')).join('+'),
+    description: briefs.map((brief) => `# Source: ${brief.path}\n\n${brief.text}`).join('\n\n'),
     tools: toolsFromOpenAPI(openapi),
     briefs,
+    ...(caseFolder ? { caseFolder: resolve(caseFolder) } : {}),
     openapi: { path: resolve(openapiPath), text: openapiText, document: openapi },
     platformDocuments: documents,
   });
@@ -140,7 +156,12 @@ export function parseWorkflowCandidate(value: unknown): WorkflowCandidate {
   return structuredClone(value) as WorkflowCandidate;
 }
 
-function bindTool(value: unknown, catalog: Tool[], lifecycle = false): JsonObject {
+function bindTool(
+  value: unknown,
+  catalog: Tool[],
+  mockBase?: string,
+  lifecycle = false,
+): JsonObject {
   const ref = typeof value === 'string' ? { name: value } : value;
   if (!object(ref) || typeof ref.name !== 'string') {
     throw new Error('Tools must be names or named references.');
@@ -159,7 +180,19 @@ function bindTool(value: unknown, catalog: Tool[], lifecycle = false): JsonObjec
   if (!tool) {
     throw new Error(`Unknown bank tool: ${ref.name}`);
   }
-  const body = structuredClone(tool.parameters);
+  const originalBody = structuredClone(tool.parameters);
+  const originalProperties = originalBody.properties as Record<string, JsonObject>;
+  const enveloped =
+    object(originalProperties.data) &&
+    originalProperties.data.type === 'object' &&
+    object(originalProperties.data.properties) &&
+    object(originalProperties.call) &&
+    originalProperties.call.type === 'object' &&
+    object(originalProperties.call.properties);
+  // The verified api_call body model accepts leaf fields under body.properties.
+  // For an external {data, call} envelope, expose the original data leaves to
+  // the model and reconstruct the source envelope immediately before HTTP.
+  const body = enveloped ? structuredClone(originalProperties.data) : originalBody;
   const properties = body.properties as Record<string, JsonObject>;
   const defaults = ref.bodyDefaults ?? {};
   if (!object(defaults) || Object.keys(defaults).some((name) => !(name in properties))) {
@@ -167,9 +200,9 @@ function bindTool(value: unknown, catalog: Tool[], lifecycle = false): JsonObjec
   }
   for (const [name, schema] of Object.entries(properties)) {
     schema.default =
-      name === 'customer_id'
-        ? '{{customer_id}}'
-        : (defaults[name] ?? `{{arg_${tool.name}_${name}}}`);
+      defaults[name] ??
+      schema.default ??
+      (name === 'customer_id' ? '{{customer_id}}' : `{{arg_${tool.name}_${name}}}`);
   }
   const result: JsonObject = {
     type: 'function',
@@ -185,7 +218,7 @@ function bindTool(value: unknown, catalog: Tool[], lifecycle = false): JsonObjec
       parameters: {
         type: 'object',
         properties: {
-          url: { type: 'string', default: tool.url },
+          url: { type: 'string', default: mockBase ? mockBase + tool.path : tool.url },
           method: { type: 'string', default: tool.method },
           headers: {
             type: 'object',
@@ -201,6 +234,22 @@ function bindTool(value: unknown, catalog: Tool[], lifecycle = false): JsonObjec
     if (key in ref) {
       result[key] = structuredClone(ref[key]);
     }
+  }
+  if (enveloped) {
+    const callProperties = originalProperties.call.properties as Record<string, JsonObject>;
+    const callDefaults = Object.fromEntries(
+      Object.entries(callProperties).map(([name, schema]) => [name, schema.default ?? '']),
+    );
+    const authored = result.pre_process_code;
+    if (authored !== undefined && typeof authored !== 'string') {
+      throw new Error(`pre_process_code must be Python text: ${tool.name}`);
+    }
+    result.pre_process_code = [
+      authored,
+      `try:\n    import json\n    _builder_data = config.get('body', {})\n    if isinstance(_builder_data, dict):\n        config['body'] = {'data': _builder_data, 'call': json.loads(${JSON.stringify(JSON.stringify(callDefaults))})}\nexcept Exception:\n    pass\n`,
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
   return result;
 }
@@ -244,8 +293,76 @@ except Exception:
   return binding;
 }
 
-export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workflow {
-  const parsed: unknown = JSON.parse(candidate.workflowJson);
+/**
+ * Drop backslashes that begin an escape JSON does not define.
+ *
+ * A model asked to embed JSON inside a JSON string sometimes writes `\'` because it is
+ * reasoning about a nested quoted literal. That single character makes the whole
+ * document unparseable and loses an entire paid generation. Every defined escape is left
+ * byte-for-byte alone, so a document that already parses is returned unchanged.
+ */
+export function relaxInvalidEscapes(source: string): string {
+  let out = '';
+  for (let i = 0; i < source.length; i += 1) {
+    if (source[i] !== '\\') {
+      out += source[i];
+      continue;
+    }
+    const next = source[i + 1];
+    if (next === undefined) {
+      out += '\\';
+      break;
+    }
+    if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(source.slice(i + 2, i + 6))) {
+      out += source.slice(i, i + 6);
+      i += 5;
+      continue;
+    }
+    if ('"\\/bfnrt'.includes(next)) {
+      out += '\\' + next;
+      i += 1;
+      continue;
+    }
+    out += next;
+    i += 1;
+  }
+  return out;
+}
+
+function parseBlueprint(source: string): unknown {
+  try {
+    return JSON.parse(source);
+  } catch (error) {
+    const relaxed = relaxInvalidEscapes(source);
+    if (relaxed === source) {
+      throw error;
+    }
+    return JSON.parse(relaxed);
+  }
+}
+
+export function compileWorkflow(
+  task: Task,
+  candidate: WorkflowCandidate,
+  options: { runtimeContract?: boolean; preciseRouting?: boolean; mockUrl?: string } = {},
+): Workflow {
+  let mockBase: string | undefined;
+  if (options.mockUrl) {
+    const target = new URL(options.mockUrl);
+    if (
+      target.protocol !== 'https:' ||
+      target.username ||
+      target.password ||
+      target.search ||
+      target.hash
+    ) {
+      throw new Error(
+        'Mock URL must be an HTTPS base URL without credentials, query, or fragment.',
+      );
+    }
+    mockBase = target.toString().replace(/\/$/, '');
+  }
+  const parsed: unknown = parseBlueprint(candidate.workflowJson);
   if (
     !object(parsed) ||
     typeof parsed.initial_node !== 'string' ||
@@ -255,6 +372,30 @@ export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workf
     throw new Error('Workflow needs an initial_node and nonempty nodes.');
   }
   const workflow = structuredClone(parsed);
+  if (options.preciseRouting) {
+    const issues = routingSafetyIssues(workflow);
+    if (issues.length) {
+      throw new Error(`Routing-precision checks failed:\n${issues.join('\n')}`);
+    }
+  }
+  if (options.runtimeContract) {
+    applyInputContract(
+      workflow,
+      task.tools.map((tool) => tool.name),
+    );
+    const issues = runtimeContractIssues(workflow);
+    if (issues.length) {
+      throw new Error(`Runtime contract checks failed:\n${issues.join('\n')}`);
+    }
+  }
+  // Every api_call gets a compiler-owned JSON snapshot of its result envelope. This is
+  // purely additive: the platform's own flattened <tool>_response.* leaves are untouched.
+  // Recorded 2026-10-11 runs showed the leaves are the ONLY representation of a
+  // container: `get_account_response.data.products` never exists, only
+  // `...products.0.past_due`. Code that reads the whole array therefore always failed and
+  // closed the call as a service error, in 8 of 10 cases. The snapshot keeps the
+  // structure, so generated code no longer depends on guessing a flattened fallback.
+  const snapshot = (binding: JsonObject) => snapshotToolResult(binding);
   const allowed = [
     'initial_node',
     'system_prompt',
@@ -291,6 +432,12 @@ export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workf
     if (raw.name !== key) {
       throw new Error(`Node name must match its key: ${key}`);
     }
+    if (raw.collection_contract !== undefined) {
+      throw new Error('collection_contract requires the runtime-contract strategy.');
+    }
+    if (raw.success_guard !== undefined) {
+      throw new Error('success_guard requires the runtime-contract strategy.');
+    }
     if (!Array.isArray(raw.transitions)) {
       throw new Error(`Node needs transitions array: ${key}`);
     }
@@ -309,7 +456,7 @@ export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workf
       if (raw.node_type !== 'conversation' || !Array.isArray(raw.tools)) {
         throw new Error(`Tools belong only on conversation nodes: ${key}`);
       }
-      raw.tools = raw.tools.map((tool) => bindTool(tool, task.tools));
+      raw.tools = raw.tools.map((tool) => snapshot(bindTool(tool, task.tools, mockBase)));
     }
     if (raw.pre_actions !== undefined) {
       if (
@@ -320,7 +467,7 @@ export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workf
       }
       raw.pre_actions = raw.pre_actions.map((action) => {
         if (raw.node_type === 'api_request') {
-          return exposePreActionResponse(bindTool(action, task.tools));
+          return snapshot(exposePreActionResponse(bindTool(action, task.tools, mockBase)));
         }
         if (
           !object(action) ||
@@ -379,7 +526,9 @@ export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workf
     if (!Array.isArray(workflow.tools)) {
       throw new Error('Lifecycle tools must be an array.');
     }
-    workflow.tools = workflow.tools.map((tool) => bindTool(tool, task.tools, true));
+    workflow.tools = workflow.tools.map((tool) =>
+      snapshot(bindTool(tool, task.tools, mockBase, true)),
+    );
   }
   // Null is not accepted by the event schema; report it rather than silently rewriting model output.
   function rejectNull(value: unknown): void {
