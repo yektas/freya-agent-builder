@@ -18,4 +18,5 @@ python3 src/contract_to_openapi.py "$case_folder" \
 node --env-file-if-exists=.env --env-file-if-exists=build-the-builder/env.sh \
   src/cli.ts freya --case-folder "$case_folder" --openapi "$openapi_file" \
   --mock-url "$mock_url" --strategy case-folder --slot final-case \
+  --model gpt-6.1-sol --reasoning-effort medium \
   --final --timeout-ms 1800000
