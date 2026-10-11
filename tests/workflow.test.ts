@@ -57,6 +57,55 @@ test('an invalid escape does not cost a paid generation, and valid JSON is untou
   assert.throws(() => compileWorkflow(task, { workflowJson: '{oops', uncertainties: [] }));
 });
 
+test('compiler recovers unescaped inner quotes in a generated string without changing its content', () => {
+  // A recorded final-case draft placed return "'" inside a JSON-encoded Python
+  // string without escaping either double quote. The outer response was valid,
+  // but the inner workflow was discarded before structural validation.
+  const authored = {
+    ...blueprint(),
+    system_prompt: `Use the literal Python expression return "'"+suffix here.`,
+  };
+  const broken = JSON.stringify(authored).replaceAll('\\"\'\\"', '"\'"');
+  assert.throws(() => JSON.parse(broken));
+  const compiled = compileWorkflow(task, { workflowJson: broken, uncertainties: [] }) as any;
+  assert.equal(compiled.system_prompt, authored.system_prompt);
+  assert.throws(() =>
+    compileWorkflow(task, {
+      workflowJson: '{"initial_node":"talk" "nodes":{}}',
+      uncertainties: [],
+    }),
+  );
+});
+
+test('compiler accepts the documented code_exec wrapper as a code action', () => {
+  const authored: any = blueprint();
+  authored.nodes.talk.node_type = 'code';
+  delete authored.nodes.talk.tools;
+  authored.nodes.talk.pre_actions = [
+    {
+      type: 'function',
+      function: {
+        name: 'code_exec',
+        handler: '__function__:code_exec',
+        parameters: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', default: "vars['status'] = 'ready'" },
+            timeout_ms: { type: 'number', default: 10000 },
+          },
+        },
+      },
+    },
+  ];
+  const compiled = compileWorkflow(task, candidate(authored)) as any;
+  assert.equal(
+    compiled.nodes.talk.pre_actions[0].function.parameters.properties.code.default,
+    "vars['status'] = 'ready'",
+  );
+  authored.nodes.talk.pre_actions[0].function.name = 'other';
+  assert.throws(() => compileWorkflow(task, candidate(authored)), /Code actions/);
+});
+
 test('API pre-actions expose current tool-named results to downstream state and routing', () => {
   const synthetic: Task = {
     id: 'synthetic-response-scope',

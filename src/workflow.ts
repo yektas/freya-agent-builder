@@ -330,15 +330,73 @@ export function relaxInvalidEscapes(source: string): string {
 }
 
 function parseBlueprint(source: string): unknown {
-  try {
-    return JSON.parse(source);
-  } catch (error) {
-    const relaxed = relaxInvalidEscapes(source);
-    if (relaxed === source) {
-      throw error;
+  // A model can produce a valid outer response but omit the backslashes around
+  // a quoted literal inside workflowJson (observed in a generated Python code
+  // string). Repair only a quote that JSON.parse has just treated as the end of
+  // a value and that is immediately followed by non-JSON content. Do not infer
+  // missing fields or delimiters. The normal compiler checks still run after it.
+  let candidate = relaxInvalidEscapes(source);
+  for (let repairs = 0; repairs <= 16; repairs += 1) {
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      if (!(error instanceof SyntaxError) || repairs === 16) {
+        throw error;
+      }
+      const position = /after (?:property value|array element) in JSON at position (\d+)/.exec(
+        error.message,
+      )?.[1];
+      const at = position === undefined ? -1 : Number(position);
+      if (
+        at < 1 ||
+        candidate[at - 1] !== '"' ||
+        !candidate[at] ||
+        /[\s,}\]:"]/.test(candidate[at])
+      ) {
+        throw error;
+      }
+      candidate = `${candidate.slice(0, at - 1)}\\${candidate.slice(at - 1)}`;
     }
-    return JSON.parse(relaxed);
   }
+  throw new Error('Unreachable blueprint parser state.');
+}
+
+function codeSource(action: unknown): string | null {
+  if (!object(action)) {
+    return null;
+  }
+  if (typeof action.code === 'string' && Object.keys(action).length === 1) {
+    return action.code;
+  }
+  if (
+    Object.keys(action).some((field) => !['type', 'function'].includes(field)) ||
+    action.type !== 'function' ||
+    !object(action.function) ||
+    Object.keys(action.function).some(
+      (field) => !['name', 'handler', 'parameters'].includes(field),
+    ) ||
+    action.function.name !== 'code_exec' ||
+    action.function.handler !== '__function__:code_exec' ||
+    !object(action.function.parameters) ||
+    action.function.parameters.type !== 'object' ||
+    !object(action.function.parameters.properties) ||
+    Object.keys(action.function.parameters.properties).some(
+      (field) => !['code', 'timeout_ms'].includes(field),
+    ) ||
+    !object(action.function.parameters.properties.code) ||
+    action.function.parameters.properties.code.type !== 'string' ||
+    typeof action.function.parameters.properties.code.default !== 'string'
+  ) {
+    return null;
+  }
+  const timeout = action.function.parameters.properties.timeout_ms;
+  if (
+    timeout !== undefined &&
+    (!object(timeout) || timeout.type !== 'number' || timeout.default !== 10000)
+  ) {
+    return null;
+  }
+  return action.function.parameters.properties.code.default;
 }
 
 export function compileWorkflow(
@@ -469,11 +527,8 @@ export function compileWorkflow(
         if (raw.node_type === 'api_request') {
           return snapshot(exposePreActionResponse(bindTool(action, task.tools, mockBase)));
         }
-        if (
-          !object(action) ||
-          typeof action.code !== 'string' ||
-          Object.keys(action).some((field) => field !== 'code')
-        ) {
+        const code = codeSource(action);
+        if (code === null) {
           throw new Error('Code actions must contain only Python source in code.');
         }
         return {
@@ -484,7 +539,7 @@ export function compileWorkflow(
             parameters: {
               type: 'object',
               properties: {
-                code: { type: 'string', default: action.code },
+                code: { type: 'string', default: code },
                 timeout_ms: { type: 'number', default: 10000 },
               },
             },
