@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { toolsFromOpenAPI, compileWorkflow, loadFreyaTask } from '../src/workflow.ts';
 import { freyaRecipe } from '../src/recipe.ts';
 import type { Task } from '../src/contracts.ts';
@@ -29,6 +30,79 @@ const blueprint = () => ({
   },
 });
 const candidate = (value: unknown) => ({ workflowJson: JSON.stringify(value), uncertainties: [] });
+
+test('API pre-actions expose current tool-named results to downstream state and routing', () => {
+  const synthetic: Task = {
+    id: 'synthetic-response-scope',
+    description: 'Synthetic platform-boundary regression, not a benchmark.',
+    tools: [
+      {
+        name: 'lookup_items',
+        description: 'Look up items.',
+        parameters: {
+          type: 'object',
+          properties: { customer_id: { type: 'string' } },
+        },
+        url: 'https://example.invalid/items',
+        method: 'POST',
+      },
+    ],
+  };
+  const input = {
+    initial_node: 'fetch',
+    nodes: {
+      fetch: {
+        name: 'fetch',
+        node_type: 'api_request',
+        passthrough: true,
+        pre_actions: [
+          { name: 'lookup_items', post_process_code: "result['data']['hook_ran'] = True" },
+        ],
+        response_mapping: [{ path: 'data.ok', variable: 'lookup_ok' }],
+        transitions: [{ target_node: 'done', condition: { operator: 'always' } }],
+      },
+      done: { name: 'done', node_type: 'end_call', transitions: [] },
+    },
+  };
+  const before = structuredClone(input);
+  const workflow = compileWorkflow(synthetic, candidate(input)) as any;
+  assert.deepEqual(input, before);
+  assert.deepEqual(workflow.nodes.fetch.response_mapping, input.nodes.fetch.response_mapping);
+  const hook = workflow.nodes.fetch.pre_actions[0].post_process_code;
+  // Reproduce the recorded boundary: pre-actions populate node-named leaves,
+  // while downstream generated code consumes tool-named leaves. Execute only
+  // our compiler hook and this authored synthetic hook, never recorded model code.
+  const output = JSON.parse(
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        `
+import json, sys
+request = json.load(sys.stdin)
+vars = {'fetch_response.data.ok': 'true', 'fetch_response.data.items.0.item_id': 'synthetic-item', 'unrelated': 'keep'}
+result = {'status': 'success', 'data': {'ok': True, 'items': [{'item_id': 'synthetic-item', 'quantity': 9}]}, 'status_code': 200}
+exec(request['hook'], {'vars': vars, 'result': result})
+first = dict(vars)
+# A later failed lookup must not retain items from the earlier success.
+result = {'status': 'error', 'data': {'ok': False, 'error': 'synthetic failure'}, 'status_code': 503}
+exec(request['hook'], {'vars': vars, 'result': result})
+print(json.dumps({'first': first, 'second': vars}))
+`,
+      ],
+      { input: JSON.stringify({ hook: hook ?? '' }), encoding: 'utf8', timeout: 2000 },
+    ),
+  );
+  assert.equal(output.first['lookup_items_response.data.items.0.item_id'], 'synthetic-item');
+  assert.equal(output.first['lookup_items_response.data.items.0.quantity'], 9);
+  assert.equal(output.first['lookup_items_response.data.ok'], 'true');
+  assert.equal(output.first['lookup_items_response.data.hook_ran'], 'true');
+  assert.equal(output.second['lookup_items_response.data.ok'], 'false');
+  assert.equal(output.second['lookup_items_response.status_code'], 503);
+  assert.equal('lookup_items_response.data.items.0.item_id' in output.second, false);
+  assert.equal(output.second['fetch_response.data.items.0.item_id'], 'synthetic-item');
+  assert.equal(output.second.unrelated, 'keep');
+});
 
 test('compiler binds original OpenAPI schemas without changing sources or accepting generated schemas', () => {
   const before = structuredClone(task);

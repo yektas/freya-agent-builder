@@ -205,6 +205,45 @@ function bindTool(value: unknown, catalog: Tool[], lifecycle = false): JsonObjec
   return result;
 }
 
+function exposePreActionResponse(binding: JsonObject): JsonObject {
+  const name = (binding.function as JsonObject).name as string;
+  const original = binding.post_process_code;
+  if (original !== undefined && typeof original !== 'string') {
+    throw new Error(`post_process_code must be Python text: ${name}`);
+  }
+  // Freya flattens pre-action responses under the NODE name, whereas
+  // conversation tools use the TOOL name. Keep the builder's tool-named
+  // contract at this boundary, including array leaves that response_mapping
+  // cannot copy. Preserve the native node result and any authored post-hook.
+  binding.post_process_code = [
+    original,
+    `try:
+    _builder_response_prefix = ${JSON.stringify(`${name}_response.`)}
+    for _builder_response_key in list(vars):
+        if str(_builder_response_key).startswith(_builder_response_prefix):
+            del vars[_builder_response_key]
+    def _builder_response_leaf(path, value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                _builder_response_leaf(path + '.' + str(key), item)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                _builder_response_leaf(path + '.' + str(index), item)
+        else:
+            vars[path] = ('true' if value else 'false') if isinstance(value, bool) else ('null' if value is None else value)
+    if isinstance(result, dict):
+        for _builder_response_field in ['status', 'data', 'message', 'status_code']:
+            if _builder_response_field in result:
+                _builder_response_leaf(_builder_response_prefix + _builder_response_field, result[_builder_response_field])
+except Exception:
+    pass
+`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return binding;
+}
+
 export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workflow {
   const parsed: unknown = JSON.parse(candidate.workflowJson);
   if (
@@ -281,7 +320,7 @@ export function compileWorkflow(task: Task, candidate: WorkflowCandidate): Workf
       }
       raw.pre_actions = raw.pre_actions.map((action) => {
         if (raw.node_type === 'api_request') {
-          return bindTool(action, task.tools);
+          return exposePreActionResponse(bindTool(action, task.tools));
         }
         if (
           !object(action) ||
