@@ -278,3 +278,76 @@ node --env-file=.env src/cli.ts build \
 The demo uses an explicitly synthetic appointment-rescheduling fixture and fake model output. Tests use injected transports and make no network calls. Mock runs and structural checks are not benchmark scores.
 
 For the event contract, start with the [research index](docs/hackathon-research-index.md) and [official kit v3 findings](docs/starter-kit-v3-2026-10-10.md). Verify current organizer updates and the actual package at event start and submission freeze.
+
+## Final runs and submission
+
+Before final runs, verify the current organizer package and updates. Install the supplied
+kit at `build-the-builder/`. Commit the builder changes first so its source snapshot is
+clean. Do not write hidden brief rules into builder code or edit generated workflows.
+
+For each hidden brief, provide its own API file:
+
+```sh
+node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya --final \
+  --brief-file briefs/hidden-1.md --openapi briefs/hidden-1.openapi.json --slot hidden-1
+```
+
+`--final` generates, compiles, validates, registers, and exports in one bounded run.
+It does not read public cases or start practice. Its evaluation remains `null`.
+Final mode rejects practice settings. Keep the run path printed by the command.
+
+For development practice, use `--repetitions 3` with the full Freya CLI. The inspector
+also supports three repetitions. Both paths now require matching original brief and
+OpenAPI contents. A-only builds cannot run B/all cases. A+B builds can run A, B, or all.
+Changed or hidden inputs cannot be scored against the public practice set.
+
+If CLI practice times out, it retains the workspace lock and reports its path. Verify
+that the remote simulation has stopped before removing the lock. An ordinary completed
+practice releases the lock. Do not start another simulation while its state is uncertain.
+
+After choosing two completed final runs, prepare their exact exports and traces:
+
+```sh
+node src/cli.ts submission \
+  --run-file experiments/RUN-1/run.json --run-file experiments/RUN-2/run.json \
+  --team TEAM --repo https://github.com/OWNER/REPO --commit BUILDER_COMMIT \
+  --out submission
+```
+
+The first run becomes hidden-1, and the second becomes hidden-2. The command validates
+the clean run source against the builder commit, export hashes, registration IDs, and
+trace fields. It refuses existing output and credential material. Both runs must use
+the same model and reasoning settings. The form initially has `commit: null`.
+
+Commit the two `submission/hidden-*.workflow.json` exports and the two
+`submission/hidden-*.trace.json` traces. Leave experiment directories and credentials
+out of Git. Then finalize against the commit that contains those files:
+
+```sh
+node src/cli.ts submission --finalize --out submission --commit SUBMISSION_COMMIT
+```
+
+Finalization verifies that both artifacts and all recorded builder source files match
+that commit. It fills `submission/submission.json` with the verified commit and run
+command. Send this form through the organizer's submission channel yourself. The
+command does not submit externally or create a Git commit.
+
+## Compare recorded evidence
+
+```sh
+node src/cli.ts compare --run-file experiments/RUN-1/run.json \
+  --run-file experiments/RUN-2/run.json
+```
+
+This offline report keeps failed and untested runs visible. It groups by input, case
+set, style, and repetition settings. Strict scores require complete three-repetition
+results; one-run checks retain a null strict score. Promised amounts come from recorded
+ledgers on passing cases, shown per repetition and summed across passing runs. Missing
+ledgers leave the amount null. Build time is available only for full runs; local
+JSON-only generation time is listed separately. No hidden-final score or ranking is
+inferred from public practice.
+
+Synthetic clean/raw input fixtures and a behavioral checkpoint list live in
+`fixtures/holdouts/`. Offline tests verify original input and changed schema preservation.
+They do not prove model extraction, date math, or phone-agent behavior. Those require
+separate budgeted evaluation before strategy promotion.

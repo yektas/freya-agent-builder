@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { hash, sourceSnapshot } from '../experiments.ts';
 import { FreyaBridge } from '../freya.ts';
 import { object } from '../validation.ts';
+import { assertPracticeInputs } from '../practice-inputs.ts';
 import { readRunArtifact } from './records.ts';
 import type { BridgeFactory, UploadOptions } from './upload.ts';
 import { reservePractice, releasePractice } from './activity.ts';
@@ -120,6 +121,14 @@ export async function startPractice(
     const recorded = JSON.parse(await readFile(run.runFile, 'utf8'));
     if (recorded.status !== 'completed') {
       throw new PracticeError(409, 'Generation is not complete.');
+    }
+    try {
+      await assertPracticeInputs(recorded.task, resolve(options.kit), brief);
+    } catch (error) {
+      throw new PracticeError(
+        422,
+        error instanceof Error ? error.message : 'Practice inputs do not match.',
+      );
     }
     const upload = JSON.parse(found.content);
     if (

@@ -11,6 +11,8 @@ import { freyaRecipe } from './recipe.ts';
 import { generateFreyaJson, runFreya } from './event.ts';
 import { estimateCost, hasUsage, sumUsage } from './usage.ts';
 import { startUi } from './ui/server.ts';
+import { prepareSubmission, finalizeSubmission } from './submission.ts';
+import { compareRuns } from './comparison.ts';
 
 const help = `Freya builder
 
@@ -24,6 +26,8 @@ node --env-file=.env --env-file=build-the-builder/env.sh src/cli.ts freya \\
   --brief-file build-the-builder/briefs/brief-a.md --practice-brief A --slot brief-a
 
 Freya options (live generation, registration, official practice, export):
+  --final                     register and export; no public practice (requires --openapi)
+  --repetitions 1|3           practice repetitions; default 1
   --json-only                 print locally compiled workflow JSON and stop
   --quiet                     hide generation progress (JSON-only mode)
   --show-draft                stream unvalidated model JSON to stderr (JSON-only mode)
@@ -36,6 +40,11 @@ Freya options (live generation, registration, official practice, export):
   --only CASE_ID,...           optional practice subset
   --style STYLE               pieces|corrects|talkative|asks_back|in_words
   --timeout-ms 1800000         total Freya run deadline (30 minutes maximum)
+
+Offline commands:
+  submission --run-file FILE --run-file FILE --out submission --team NAME --repo URL --commit SHA
+  submission --finalize --out submission --commit SHA
+  compare --run-file FILE [--run-file FILE ...]
 
 Options:
   --provider mock|openai or BUILDER_PROVIDER; build only, defaults to mock
@@ -83,6 +92,13 @@ async function main() {
       only: { type: 'string' },
       style: { type: 'string' },
       'json-only': { type: 'boolean' },
+      final: { type: 'boolean' },
+      finalize: { type: 'boolean' },
+      repetitions: { type: 'string' },
+      'run-file': { type: 'string', multiple: true },
+      team: { type: 'string' },
+      repo: { type: 'string' },
+      commit: { type: 'string' },
       quiet: { type: 'boolean' },
       'show-draft': { type: 'boolean' },
       'reasoning-summary': { type: 'boolean' },
@@ -96,8 +112,44 @@ async function main() {
     console.log(help);
     return;
   }
-  if (positionals.length !== 1 || !['build', 'freya', 'ui'].includes(positionals[0])) {
-    throw new Error('Supply the build, freya, or ui command. Use --help.');
+  if (
+    positionals.length !== 1 ||
+    !['build', 'freya', 'ui', 'submission', 'compare'].includes(positionals[0])
+  ) {
+    throw new Error('Supply build, freya, ui, submission, or compare. Use --help.');
+  }
+  if (positionals[0] === 'submission') {
+    if (values.finalize) {
+      console.log(
+        JSON.stringify(
+          await finalizeSubmission(
+            values.out === 'experiments' ? 'submission' : values.out!,
+            values.commit ?? '',
+          ),
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    console.log(
+      JSON.stringify(
+        await prepareSubmission({
+          runs: values['run-file'] ?? [],
+          out: values.out === 'experiments' ? 'submission' : values.out!,
+          team: values.team ?? '',
+          repo: values.repo ?? '',
+          commit: values.commit ?? '',
+        }),
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  if (positionals[0] === 'compare') {
+    console.log(JSON.stringify(await compareRuns(values['run-file'] ?? []), null, 2));
+    return;
   }
   if (positionals[0] === 'ui') {
     const port = Number(values.port);
@@ -134,6 +186,19 @@ async function main() {
     if (values.provider && values.provider !== 'openai') {
       throw new Error('The freya command uses the OpenAI Responses API; provider must be openai.');
     }
+    if (
+      values.final &&
+      (!values.openapi ||
+        values['json-only'] ||
+        values['practice-brief'] ||
+        values.only ||
+        values.style ||
+        values.repetitions)
+    ) {
+      throw new Error(
+        '--final requires --openapi and does not accept JSON-only or practice settings.',
+      );
+    }
     if (values['json-only']) {
       const workflow = await generateFreyaJson({
         briefs: values['brief-file'] || [resolve(values.kit!, 'briefs/brief-a.md')],
@@ -168,6 +233,8 @@ async function main() {
       brief: values['practice-brief'],
       only: values.only,
       style: values.style,
+      final: values.final,
+      repetitions: values.repetitions === undefined ? undefined : Number(values.repetitions),
       timeoutMs: Number(
         process.argv.includes('--timeout-ms') ||
           process.argv.some((arg) => arg.startsWith('--timeout-ms='))

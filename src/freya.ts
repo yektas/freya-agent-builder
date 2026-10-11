@@ -17,7 +17,7 @@ export type FreyaResult = {
   candidate: unknown;
   workflow: JsonObject;
   registration: Registration;
-  evaluation: PracticeResult;
+  evaluation: PracticeResult | null;
   export: unknown;
 };
 

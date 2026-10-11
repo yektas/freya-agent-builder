@@ -1,0 +1,9 @@
+{
+  "synthetic": true,
+  "description": "Expected policy calculations for the synthetic briefs. Not hosted bank cases or benchmark scores.",
+  "cases": [
+    { "now": "2027-01-01T11:00:00", "latest_date": "2027-01-08", "balance": 101, "minimum": 36 },
+    { "now": "2027-01-05T11:00:00", "latest_date": "2027-01-11", "balance": 200, "minimum": 70 },
+    { "now": "2027-01-07T11:00:00", "latest_date": "2027-01-12", "balance": 1000, "minimum": 350 }
+  ]
+}

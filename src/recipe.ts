@@ -86,13 +86,13 @@ Generate directly in one call. No manual edits, planning calls, audit, or repair
     return { candidate, workflow };
   },
 
-  async run(task: Task, steps: FreyaSteps) {
+  async run(task: Task, steps: FreyaSteps, options: { practice?: boolean } = {}) {
     const { candidate, workflow } = await this.generate(task, steps);
     await steps.validate(workflow);
     const registration = await steps.register(workflow);
     // Export before testing so a failed/timed-out test cannot discard the selected workflow.
     const exported = await steps.export(registration);
-    const evaluation = await steps.evaluate(registration);
+    const evaluation = options.practice === false ? null : await steps.evaluate(registration);
     return { candidate, workflow, registration, export: exported, evaluation };
   },
 };

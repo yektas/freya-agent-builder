@@ -277,3 +277,20 @@ test('a timeout is bounded and preserves the workspace lock until the remote sim
   assert.ok(await readFile(lock, 'utf8'));
   assert.equal((await h.post()).status, 409);
 });
+
+test('A-only, edited briefs, and changed OpenAPI cannot produce mismatched practice scores', async () => {
+  const h = await fixture();
+  const record = JSON.parse(h.run);
+  record.task.briefs = [record.task.briefs[0]];
+  await writeFile(join(h.directory, 'run.json'), JSON.stringify(record));
+  assert.equal((await h.post({ brief: 'B' })).status, 422);
+  assert.equal((await h.post({ brief: 'all' })).status, 422);
+  record.task.briefs[0].text += '\nChanged business rule.';
+  await writeFile(join(h.directory, 'run.json'), JSON.stringify(record));
+  assert.equal((await h.post({ brief: 'A' })).status, 422);
+  record.task = JSON.parse(h.run).task;
+  record.task.openapi.text += '\n';
+  await writeFile(join(h.directory, 'run.json'), JSON.stringify(record));
+  assert.equal((await h.post({ brief: 'A' })).status, 422);
+  assert.deepEqual(h.calls, []);
+});

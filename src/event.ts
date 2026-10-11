@@ -18,6 +18,8 @@ import { createOpenAIGenerator } from './providers.ts';
 import type { CallRecord, ModelEvent, ReasoningEffort } from './providers.ts';
 import { createGenerationTrace } from './generation-trace.ts';
 import { estimateCost, hasUsage, sumUsage } from './usage.ts';
+import type { Generator } from './contracts.ts';
+import { assertPracticeInputs } from './practice-inputs.ts';
 
 // Totals a generator's recorded calls so a run reports one comparable figure.
 function usageOf(calls: CallRecord[], model: string) {
@@ -37,6 +39,8 @@ export type EventOptions = {
   timeoutMs: number;
   model: string;
   reasoningEffort?: ReasoningEffort;
+  final?: boolean;
+  repetitions?: number;
 };
 
 function workflowGenerator(
@@ -198,12 +202,22 @@ export async function generateFreyaJson(
 
 export async function runFreya(
   options: EventOptions,
+  dependencies: {
+    env?: NodeJS.ProcessEnv;
+    generator?: Generator & { calls: CallRecord[] };
+    bridge?: (
+      kit: string,
+      trace: string,
+      env: NodeJS.ProcessEnv,
+    ) => Pick<FreyaBridge, 'call' | 'redact' | 'env'>;
+  } = {},
 ): Promise<{ status: string; path: string; error?: string }> {
   const provider = 'openai';
+  const env = dependencies.env ?? process.env;
   if (
-    !process.env.FREYA_API_KEY?.trim() ||
-    !process.env.FREYA_BANK_TEAM_KEY ||
-    process.env.FREYA_BANK_TEAM_KEY.length < 16
+    !env.FREYA_API_KEY?.trim() ||
+    !env.FREYA_BANK_TEAM_KEY ||
+    env.FREYA_BANK_TEAM_KEY.length < 16
   ) {
     throw new Error(
       'Freya runs require FREYA_API_KEY and FREYA_BANK_TEAM_KEY (at least 16 characters).',
@@ -221,35 +235,51 @@ export async function runFreya(
   ) {
     throw new Error('Freya timeout must be from 1 to 1800000 ms.');
   }
-  const kit = resolve(options.kit);
-  const task = await loadFreyaTask(options.briefs, options.openapi, kit);
-  // Validate the case selection before any model call or remote mutation.
-  const casesPath = join(kit, 'public-test-set.json');
-  const cases: unknown = JSON.parse(await readFile(casesPath, 'utf8'));
-  if (!Array.isArray(cases) || !cases.every(object)) {
-    throw new Error('Invalid official practice case file.');
-  }
-  const ids = options.only?.split(',');
-  const selected = cases.filter(
-    (item) =>
-      (!options.brief || item.brief === options.brief) && (!ids || ids.includes(String(item.id))),
-  );
-  if (!selected.length || (ids && ids.some((id) => !selected.some((item) => item.id === id)))) {
-    throw new Error('Practice selection is empty or contains unknown cases.');
-  }
-  if (
-    options.style &&
-    !['pieces', 'corrects', 'talkative', 'asks_back', 'in_words'].includes(options.style)
-  ) {
-    throw new Error('Unknown practice speaking style.');
-  }
-
   const startedAt = new Date().toISOString();
   const started = performance.now();
+  const kit = resolve(options.kit);
+  const task = await loadFreyaTask(options.briefs, options.openapi, kit);
+  const practice = !options.final;
+  const repetitions = options.repetitions ?? 1;
+  if (![1, 3].includes(repetitions)) {
+    throw new Error('Choose one or three repetitions.');
+  }
+  if (
+    options.final &&
+    (options.brief || options.only || options.style || options.repetitions !== undefined)
+  ) {
+    throw new Error('Final mode does not accept practice settings.');
+  }
+  // Validate practice selection before any model call or remote mutation.
+  const casesPath = join(kit, 'public-test-set.json');
+  if (practice) {
+    await assertPracticeInputs(task, kit, options.brief ?? 'all');
+    const cases: unknown = JSON.parse(await readFile(casesPath, 'utf8'));
+    if (!Array.isArray(cases) || !cases.every(object)) {
+      throw new Error('Invalid official practice case file.');
+    }
+    const ids = options.only?.split(',');
+    const selected = cases.filter(
+      (item) =>
+        (!options.brief || item.brief === options.brief) && (!ids || ids.includes(String(item.id))),
+    );
+    if (!selected.length || (ids && ids.some((id) => !selected.some((item) => item.id === id)))) {
+      throw new Error('Practice selection is empty or contains unknown cases.');
+    }
+    if (
+      options.style &&
+      !['pieces', 'corrects', 'talkative', 'asks_back', 'in_words'].includes(options.style)
+    ) {
+      throw new Error('Unknown practice speaking style.');
+    }
+  }
+
   const directory = resolve(options.out, randomUUID());
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, 'run.json');
-  const bridge = new FreyaBridge(kit, join(directory, 'platform.jsonl'));
+  const bridge =
+    dependencies.bridge?.(kit, join(directory, 'platform.jsonl'), env) ??
+    new FreyaBridge(kit, join(directory, 'platform.jsonl'), env);
   const source = await sourceSnapshot();
   const kitFiles: Record<string, string> = {};
   for (const name of [
@@ -261,13 +291,15 @@ export async function runFreya(
     'docs/api.md',
     'docs/workflow-format.md',
     'docs/tools-and-code.md',
-    'public-test-set.json',
+    ...(practice ? ['public-test-set.json'] : []),
   ]) {
     kitFiles[name] = await readFile(join(kit, name), 'utf8');
   }
-  const generator = workflowGenerator(options.model, fetch, {
-    reasoningEffort: options.reasoningEffort,
-  });
+  const generator =
+    dependencies.generator ??
+    workflowGenerator(options.model, fetch, {
+      reasoningEffort: options.reasoningEffort,
+    });
   const record: Record<string, any> = {
     kind: 'freya-live-run',
     status: 'running',
@@ -289,9 +321,11 @@ export async function runFreya(
     // Recomputed on every save: the generator keeps filling its call list, and a
     // record written before the call completes must not report usage.
     record.usage = usageOf(generator.calls, options.model);
-    writeFile(path, bridge.redact(JSON.stringify(record, null, 2)) + '\n', { mode: 0o600 });
+    return writeFile(path, bridge.redact(JSON.stringify(record, null, 2)) + '\n', { mode: 0o600 });
   };
-  const signal = AbortSignal.timeout(options.timeoutMs);
+  const signal = AbortSignal.timeout(
+    Math.max(1, options.timeoutMs - Math.round(performance.now() - started)),
+  );
   const remaining = () => Math.max(1, options.timeoutMs - Math.round(performance.now() - started));
   const invoke = (action: string, data: Record<string, unknown>) =>
     bridge.call(action, data, signal, remaining());
@@ -322,11 +356,12 @@ export async function runFreya(
   try {
     const workspace = await stage('workspace', () => invoke('probe', {}));
     // Never silently choose the first workspace; the bridge verifies one explicit or unique workspace.
-    bridge.env = { ...process.env, FREYA_WORKSPACE_ID: workspace.workspaceId };
+    bridge.env = { ...env, FREYA_WORKSPACE_ID: workspace.workspaceId };
     const stateRoot = resolve(options.out, 'freya-state', workspace.workspaceId);
     await mkdir(stateRoot, { recursive: true, mode: 0o700 });
     // Exclusive slot lock avoids two runs racing to create duplicate workflows or update during tests.
     const lock = join(stateRoot, 'workspace.lock');
+    let uncertainPractice = false;
     const { open, unlink } = await import('node:fs/promises');
     const handle = await open(lock, 'wx', 0o600).catch(() => {
       throw new Error(
@@ -336,74 +371,99 @@ export async function runFreya(
     await handle.writeFile(JSON.stringify({ pid: process.pid, run: path }));
     await handle.close();
     try {
-      const result = await freyaRecipe.run(task, {
-        generate: (input) =>
-          stage('candidate', () =>
-            generator.generate(
-              input,
-              AbortSignal.any([
-                signal,
-                AbortSignal.timeout(freyaRecipe.limits.generationTimeoutMs),
-              ]),
+      const result = await freyaRecipe.run(
+        task,
+        {
+          generate: (input) =>
+            stage('candidate', () =>
+              generator.generate(
+                input,
+                AbortSignal.any([
+                  signal,
+                  AbortSignal.timeout(freyaRecipe.limits.generationTimeoutMs),
+                ]),
+              ),
             ),
-          ),
-        compile: async (input, candidate) =>
-          stage('workflow', async () => {
-            const workflow = compileWorkflow(input, parseWorkflowCandidate(candidate));
-            await writeFile(
-              join(directory, 'compiled.workflow.json'),
-              JSON.stringify(workflow, null, 2) + '\n',
-              { mode: 0o600 },
-            );
-            return workflow;
-          }),
-        validate: (workflow) =>
-          stage('validation', () => invoke('validate', { slot: options.slot, workflow })),
-        register: (workflow) =>
-          stage<Registration>('registration', () =>
-            invoke('register', {
-              slot: options.slot,
-              workflow,
-              stateFile: join(stateRoot, 'slots.json'),
+          compile: async (input, candidate) =>
+            stage('workflow', async () => {
+              const workflow = compileWorkflow(input, parseWorkflowCandidate(candidate));
+              await writeFile(
+                join(directory, 'compiled.workflow.json'),
+                JSON.stringify(workflow, null, 2) + '\n',
+                { mode: 0o600 },
+              );
+              record.workflowHash = hash(workflow);
+              return workflow;
             }),
-          ),
-        export: (registration) =>
-          stage('export', () =>
-            invoke('export', {
-              workflowId: registration.workflow_id,
-              path: join(directory, 'exported.workflow.json'),
+          validate: (workflow) =>
+            stage('validation', () => invoke('validate', { slot: options.slot, workflow })),
+          register: (workflow) =>
+            stage<Registration>('registration', () =>
+              invoke('register', {
+                slot: options.slot,
+                workflow,
+                stateFile: join(stateRoot, 'slots.json'),
+              }),
+            ),
+          export: (registration) =>
+            stage('export', async () => {
+              const exported = await invoke('export', {
+                workflowId: registration.workflow_id,
+                path: join(directory, 'exported.workflow.json'),
+              });
+              record.exportHash = hash(
+                JSON.parse(await readFile(join(directory, 'exported.workflow.json'), 'utf8')),
+              );
+              return exported;
             }),
-          ),
-        evaluate: (registration) =>
-          stage<PracticeResult>('practice', () =>
-            invoke('practice', {
-              agentId: registration.agent_id,
-              casesPath,
-              cacheDir: join(stateRoot, 'practice'),
-              path: join(directory, 'practice.json'),
-              brief: options.brief,
-              only: options.only,
-              style: options.style,
+          evaluate: (registration) =>
+            stage<PracticeResult>('practice', async () => {
+              try {
+                return await invoke('practice', {
+                  agentId: registration.agent_id,
+                  casesPath,
+                  cacheDir: join(stateRoot, 'practice'),
+                  path: join(directory, 'practice.json'),
+                  brief: options.brief,
+                  only: options.only,
+                  style: options.style,
+                  repetitions,
+                });
+              } catch (error) {
+                const reason = error instanceof Error ? error.message : String(error);
+                uncertainPractice = signal.aborted || /deadline|timed out|timeout/i.test(reason);
+                if (uncertainPractice) {
+                  record.retainedWorkspaceLock = lock;
+                  throw new Error(
+                    `Practice completion is uncertain. The remote simulation may still be running. Verify it has stopped before removing ${lock}.`,
+                  );
+                }
+                throw error;
+              }
             }),
-          ),
-      });
-      record.evaluation = {
-        score: result.evaluation.passed / result.evaluation.total,
-        source: 'official-practice',
-        passed: result.evaluation.passed,
-        total: result.evaluation.total,
-        repetitions: 1,
-        details:
-          'Original event runner: bank ledger + conversation judge. One practice run, not the final three-run benchmark.',
-      };
+        },
+        { practice },
+      );
+      if (result.evaluation) {
+        record.evaluation = {
+          score: result.evaluation.passed / result.evaluation.total,
+          source: 'official-practice',
+          passed: result.evaluation.passed,
+          total: result.evaluation.total,
+          repetitions,
+          details: `Original event runner: bank ledger + conversation judge. ${repetitions} repetition(s); public practice, not the hidden final benchmark.`,
+        };
+      }
       record.status = 'completed';
     } finally {
-      await unlink(lock);
+      if (!uncertainPractice) {
+        await unlink(lock);
+      }
     }
   } catch (error) {
     record.status = 'failed';
     record.error = bridge.redact(
-      signal.aborted
+      signal.aborted && !record.retainedWorkspaceLock
         ? 'End-to-end deadline exceeded.'
         : error instanceof Error
           ? error.message
