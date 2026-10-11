@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import urllib.request
+import uuid
 
 request = json.load(sys.stdin)
 kit = pathlib.Path(request['kit']).resolve()
@@ -89,7 +90,10 @@ def main():
             raise RuntimeError('Set FREYA_WORKSPACE_ID to one accessible workspace; automatic selection requires exactly one workspace')
         return {'workspaceId': matches[0]['id'], 'name': matches[0].get('name'), 'agentLlm': freya.AGENT_LLM}
     if action == 'validate':
-        return freya.validate_workflow(request.get('workflowName', request['slot']), request['workflow'])
+        # The dry-run endpoint rejects a name already used by a registered
+        # workflow. Give validation its own disposable name so a slot can be
+        # validated again before its existing workflow is updated.
+        return freya.validate_workflow('validation-' + uuid.uuid4().hex[:16], request['workflow'])
     if action == 'register':
         # Preserve the organizer helper's slot/update semantics while giving a
         # newly created workflow a useful name independent of its state key.

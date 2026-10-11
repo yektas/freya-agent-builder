@@ -25,6 +25,7 @@ import io, json, os, pathlib, time, urllib.request
 root = pathlib.Path(os.environ['SYNTHETIC_TRANSPORT_ROOT'])
 fixture = json.loads((root / 'fixture.json').read_text())
 state = root / 'transport-state.json'
+created_name = root / 'created-name.txt'
 time.sleep = lambda seconds: None
 
 def urlopen(request, **kwargs):
@@ -39,7 +40,11 @@ def urlopen(request, **kwargs):
     if path == '/api/v2/workspaces':
         result = {'workspaces': [{'id': 'synthetic-workspace', 'name': 'Offline fixture'}]}
     elif path == '/api/v2/workflow' and method == 'POST':
-        if 'dryRun' not in request.full_url:
+        if 'dryRun' in request.full_url:
+            if created_name.exists() and created_name.read_text() == body['name']:
+                raise RuntimeError('A workflow with this name already exists')
+        else:
+            created_name.write_text(body['name'])
             state.write_text(json.dumps(body['workflow']))
             if os.environ.get('SYNTHETIC_FAIL_CREATE'):
                 raise RuntimeError('Synthetic timeout after remote create')
@@ -109,14 +114,16 @@ urllib.request.urlopen = urlopen
     const stateFile = join(directory, 'slots.json');
     await call('register', { slot: 'fixture', workflow, stateFile });
     await call('register', { slot: 'fixture', workflow, stateFile });
+    await call('validate', { slot: 'fixture', workflow });
     const requests = (await readFile(requestLog, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
-    assert.equal(
-      requests.filter((item) => item.method === 'POST' && item.path === '/api/v2/workflow').length,
-      2,
-    ); // one dry run + one creation
+    const creationRequests = requests.filter(
+      (item) => item.method === 'POST' && item.path === '/api/v2/workflow',
+    );
+    assert.equal(creationRequests.length, 3); // two dry runs + one creation
+    assert.notEqual(creationRequests[2].body.name, creationRequests[1].body.name);
     assert.ok(
       requests.some((item) => item.path.endsWith('/publish') && item.body.versionId === 'v2'),
     );
